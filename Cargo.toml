@@ -1,0 +1,25 @@
+[package]
+name = "qp-meme-gen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+arboard = "3.6.1"
+eframe = "0.36.1"
+image = "0.25.10"
+rfd = "0.17.2"
+rten = "0.25.0"
+rten-tensor = "0.25.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
