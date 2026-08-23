@@ -2897,6 +2897,7 @@ dependencies = [
 name = "qp-meme-gen"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "arboard",
  "eframe",

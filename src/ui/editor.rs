@@ -9,6 +9,7 @@ use image::RgbaImage;
 
 use crate::config::DirectionPref;
 use crate::core::mirror::{self, Direction, Rect};
+use crate::core::text as overlay_text;
 use crate::detect::Face;
 use crate::ui::theme;
 use crate::ui::toast::ToastKind;
@@ -18,6 +19,10 @@ const FACE_IOU: f32 = 0.3;
 const ADD_STAGGER: f32 = 0.04;
 /// 无人脸时中央框占画面宽、高的比例。
 const CENTER_BOX_FRAC: f32 = 0.4;
+
+fn default_text_size(img_w: u32, img_h: u32) -> f32 {
+    ((img_w.min(img_h) as f32) * 0.1).clamp(32.0, 120.0)
+}
 
 pub enum EditorRequest {
     None,
@@ -81,6 +86,49 @@ enum DragMode {
         start: (f32, f32),
         current: Rect,
     },
+    MoveText {
+        index: usize,
+        grab_dx: f32,
+        grab_dy: f32,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextColor {
+    White,
+    Black,
+    Yellow,
+}
+
+impl TextColor {
+    fn fill(self) -> [u8; 3] {
+        match self {
+            Self::White => [255, 255, 255],
+            Self::Black => [20, 20, 20],
+            Self::Yellow => [255, 224, 48],
+        }
+    }
+
+    fn outline(self) -> [u8; 3] {
+        match self {
+            Self::Black => [255, 255, 255],
+            _ => [0, 0, 0],
+        }
+    }
+
+    fn preview(self) -> egui::Color32 {
+        let [r, g, b] = self.fill();
+        egui::Color32::from_rgb(r, g, b)
+    }
+}
+
+struct TextOverlay {
+    id: u64,
+    text: String,
+    x: f32,
+    y: f32,
+    size: f32,
+    color: TextColor,
 }
 
 /// 程序性选框变化（人脸/整图/加框）的过渡动画。
@@ -150,6 +198,15 @@ pub struct Editor {
     result_img: Option<RgbaImage>,
     dirty: bool,
     drag: DragMode,
+    texts: Vec<TextOverlay>,
+    text_focus: Option<usize>,
+    text_panel: bool,
+    text_draft: String,
+    text_draft_size: f32,
+    text_draft_color: TextColor,
+    text_need_focus: bool,
+    /// 正在输入。选中但未进入输入时只显示选框，可拖动改位置。
+    text_editing: bool,
 }
 
 fn lerp_i32(a: i32, b: i32, t: f32) -> i32 {
@@ -210,7 +267,8 @@ pub fn pick_next_face<'a>(faces: &'a [Face], boxes: &[Rect]) -> Option<&'a Face>
 
 impl Editor {
     pub fn new(img: RgbaImage, path: Option<PathBuf>, dir_pref: DirectionPref) -> Self {
-        let rect = Rect::new(0, 0, img.width() as i32, img.height() as i32);
+        let (img_w, img_h) = (img.width(), img.height());
+        let rect = Rect::new(0, 0, img_w as i32, img_h as i32);
         Self {
             img,
             path,
@@ -231,6 +289,14 @@ impl Editor {
             result_img: None,
             dirty: true,
             drag: DragMode::Idle,
+            texts: Vec::new(),
+            text_focus: None,
+            text_panel: false,
+            text_draft: String::new(),
+            text_draft_size: default_text_size(img_w, img_h),
+            text_draft_color: TextColor::White,
+            text_need_focus: false,
+            text_editing: false,
         }
     }
 
@@ -254,6 +320,138 @@ impl Editor {
 
     fn img_size(&self) -> (i32, i32) {
         (self.img.width() as i32, self.img.height() as i32)
+    }
+
+    fn placing_text(&self) -> bool {
+        self.text_panel
+    }
+
+    fn clamp_text_focus(&mut self) {
+        if let Some(i) = self.text_focus
+            && i >= self.texts.len()
+        {
+            self.text_focus = None;
+        }
+    }
+
+    fn select_text(&mut self, i: usize) {
+        if i >= self.texts.len() {
+            return;
+        }
+        self.text_focus = Some(i);
+        self.text_panel = true;
+        let t = &self.texts[i];
+        self.text_draft = t.text.clone();
+        self.text_draft_size = t.size;
+        self.text_draft_color = t.color;
+        self.text_need_focus = false;
+        self.text_editing = false;
+    }
+
+    #[cfg(test)]
+    fn place_text(&mut self, x: f32, y: f32) {
+        let text = self.text_draft.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let (w, h) = self.img_size();
+        let id = self.alloc_id();
+        self.texts.push(TextOverlay {
+            id,
+            text,
+            x: x.clamp(0.0, w as f32),
+            y: y.clamp(0.0, h as f32),
+            size: self.text_draft_size.clamp(16.0, 160.0),
+            color: self.text_draft_color,
+        });
+        self.text_focus = Some(self.texts.len() - 1);
+        self.dirty = true;
+    }
+
+    fn begin_text_at(&mut self, x: f32, y: f32) {
+        self.commit_or_drop_focused();
+        let (w, h) = self.img_size();
+        let id = self.alloc_id();
+        self.texts.push(TextOverlay {
+            id,
+            text: String::new(),
+            x: x.clamp(0.0, w as f32),
+            y: y.clamp(0.0, h as f32),
+            size: self.text_draft_size.clamp(16.0, 160.0),
+            color: self.text_draft_color,
+        });
+        self.text_focus = Some(self.texts.len() - 1);
+        self.text_draft.clear();
+        self.text_need_focus = true;
+        self.text_editing = true;
+        self.text_panel = true;
+    }
+
+    fn commit_or_drop_focused(&mut self) {
+        let Some(i) = self.text_focus else {
+            return;
+        };
+        if self.texts.get(i).is_some_and(|t| t.text.trim().is_empty()) {
+            self.texts.remove(i);
+        } else if i < self.texts.len() {
+            self.dirty = true;
+        }
+        self.text_focus = None;
+        self.text_need_focus = false;
+        self.text_editing = false;
+    }
+
+    fn remove_text(&mut self, i: usize) {
+        if i < self.texts.len() {
+            self.texts.remove(i);
+            self.text_focus = None;
+            self.text_need_focus = false;
+            self.text_editing = false;
+            self.dirty = true;
+        }
+    }
+
+    /// 文字先画到源图，再按选框镜像，效果与照片像素相同。
+    fn compose_result(&self) -> RgbaImage {
+        self.compose_skipping(None)
+    }
+
+    fn compose_skipping(&self, skip: Option<usize>) -> RgbaImage {
+        let mut src = self.img.clone();
+        if let Some(font) = overlay_text::system_font() {
+            for (i, t) in self.texts.iter().enumerate() {
+                if skip == Some(i) {
+                    continue;
+                }
+                overlay_text::draw(
+                    &mut src,
+                    font,
+                    &t.text,
+                    (t.x, t.y),
+                    t.size,
+                    t.color.fill(),
+                    t.color.outline(),
+                );
+            }
+        }
+        let mut out = src.clone();
+        for b in &self.boxes {
+            if !b.appeared() {
+                continue;
+            }
+            let sel = b.displayed();
+            if b.show_original {
+                mirror::copy_rect(&mut out, &src, sel);
+            } else {
+                let dir = match b.dir_pref {
+                    DirectionPref::Left => Direction::Left,
+                    DirectionPref::Right => Direction::Right,
+                    DirectionPref::Auto => mirror::auto_direction(&self.img, sel),
+                };
+                mirror::apply_mirror(&mut out, &src, sel, dir);
+            }
+        }
+        out
     }
 
     fn tick_anims(&mut self) {
@@ -429,23 +627,12 @@ impl Editor {
         if !self.dirty && !self.any_animating() && self.result_img.is_some() {
             return;
         }
-        let mut out = self.img.clone();
-        for b in &self.boxes {
-            if !b.appeared() {
-                continue;
-            }
-            let sel = b.displayed();
-            if b.show_original {
-                mirror::copy_rect(&mut out, &self.img, sel);
-            } else {
-                let dir = match b.dir_pref {
-                    DirectionPref::Left => Direction::Left,
-                    DirectionPref::Right => Direction::Right,
-                    DirectionPref::Auto => mirror::auto_direction(&self.img, sel),
-                };
-                mirror::apply_mirror(&mut out, &self.img, sel, dir);
-            }
-        }
+        let skip = if self.text_editing {
+            self.text_focus
+        } else {
+            None
+        };
+        let out = self.compose_skipping(skip);
         let ci = egui::ColorImage::from_rgba_unmultiplied(
             [out.width() as usize, out.height() as usize],
             out.as_raw(),
@@ -456,9 +643,7 @@ impl Editor {
     }
 
     fn save_as(&self) -> EditorRequest {
-        let Some(out) = &self.result_img else {
-            return EditorRequest::Toast(ToastKind::Error, "没有可保存的结果".into());
-        };
+        let out = self.compose_result();
         let default_name = self
             .path
             .as_ref()
@@ -481,13 +666,11 @@ impl Editor {
     }
 
     fn copy_to_clipboard(&self) -> EditorRequest {
-        let Some(out) = &self.result_img else {
-            return EditorRequest::Toast(ToastKind::Error, "没有可复制的结果".into());
-        };
+        let out = self.compose_result();
         let data = arboard::ImageData {
             width: out.width() as usize,
             height: out.height() as usize,
-            bytes: Cow::Borrowed(out.as_raw()),
+            bytes: Cow::Owned(out.into_raw()),
         };
         match arboard::Clipboard::new().and_then(|mut cb| cb.set_image(data)) {
             Ok(()) => EditorRequest::Toast(ToastKind::Success, "已复制到剪贴板".into()),
@@ -604,17 +787,190 @@ fn hit_boxes(pos: (f32, f32), rects: &[Rect], focus: usize) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+fn hit_texts(ed: &Editor, pos: (f32, f32)) -> Option<usize> {
+    let font = overlay_text::system_font()?;
+    ed.texts
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, t)| {
+            overlay_text::bounds(font, &t.text, t.x, t.y, t.size).is_some_and(|(x0, y0, x1, y1)| {
+                let pad = 12.0;
+                pos.0 >= x0 - pad && pos.0 < x1 + pad && pos.1 >= y0 - pad && pos.1 < y1 + pad
+            })
+        })
+        .map(|(i, _)| i)
+}
+
+fn inline_text_rect(view: &View, t: &TextOverlay) -> egui::Rect {
+    let font_px = (t.size * view.scale).clamp(22.0, 180.0);
+    let n = t.text.chars().count().max(4) as f32;
+    let w = (n * font_px * 0.95 + 56.0).clamp(320.0, (view.rect.width() * 0.9).max(320.0));
+    let h = (font_px * 1.9 + 52.0).clamp(84.0, 200.0);
+    egui::Rect::from_center_size(view.to_screen(t.x, t.y), egui::vec2(w, h))
+}
+
+fn show_inline_editor(ui: &mut egui::Ui, ed: &mut Editor, view: &View) {
+    if !ed.text_editing {
+        return;
+    }
+    let Some(i) = ed.text_focus else {
+        return;
+    };
+    if i >= ed.texts.len() {
+        return;
+    }
+    let id = ed.texts[i].id;
+    let size = ed.texts[i].size;
+    let color = ed.texts[i].color;
+    let rect = inline_text_rect(view, &ed.texts[i]);
+    let font_px = (size * view.scale).clamp(22.0, 180.0);
+    let p = *theme::palette(ui.ctx());
+    let mut text = ed.texts[i].text.clone();
+    let need_focus = ed.text_need_focus;
+    let bg = match color {
+        TextColor::Black => p.card,
+        _ => egui::Color32::from_rgba_unmultiplied(18, 18, 18, 220),
+    };
+
+    let mut drag_delta = egui::Vec2::ZERO;
+    egui::Area::new(egui::Id::new(("inline_text", id)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .movable(false)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_size(rect.size());
+            ui.set_max_width(rect.width());
+            egui::Frame::NONE
+                .fill(bg)
+                .stroke(egui::Stroke::new(2.0, p.accent))
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    let bar = ui.allocate_response(
+                        egui::vec2(ui.available_width(), 22.0),
+                        egui::Sense::click_and_drag(),
+                    );
+                    let bar = bar.on_hover_cursor(egui::CursorIcon::Move);
+                    ui.painter().text(
+                        bar.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "↕ 拖动移动",
+                        egui::FontId::proportional(13.0),
+                        p.text_secondary,
+                    );
+                    if bar.dragged() {
+                        drag_delta = bar.drag_delta();
+                    }
+                    let te = egui::TextEdit::multiline(&mut text)
+                        .font(egui::FontId::proportional(font_px))
+                        .text_color(color.preview())
+                        .desired_width(rect.width() - 28.0)
+                        .desired_rows(1)
+                        .frame(egui::Frame::NONE)
+                        .hint_text("输入文字");
+                    let resp = ui.add(te);
+                    if need_focus {
+                        resp.request_focus();
+                    }
+                });
+        });
+
+    if need_focus {
+        ed.text_need_focus = false;
+        ui.ctx().request_repaint();
+    }
+    if let Some(t) = ed.texts.get_mut(i)
+        && t.text != text
+    {
+        t.text = text;
+        ed.text_draft = t.text.clone();
+    }
+    if drag_delta != egui::Vec2::ZERO {
+        let (w, h) = (ed.img.width() as f32, ed.img.height() as f32);
+        if let Some(t) = ed.texts.get_mut(i) {
+            t.x = (t.x + drag_delta.x / view.scale).clamp(0.0, w);
+            t.y = (t.y + drag_delta.y / view.scale).clamp(0.0, h);
+        }
+    }
+}
+
+fn show_text_bar(ui: &mut egui::Ui, ed: &mut Editor) {
+    let p = *theme::palette(ui.ctx());
+    ui.horizontal(|ui| {
+        ui.set_height(40.0);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.label(
+            egui::RichText::new("字号")
+                .size(14.0)
+                .color(p.text_secondary),
+        );
+        ui.allocate_ui_with_layout(
+            egui::vec2(220.0, 28.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let size = ui.add(
+                    egui::Slider::new(&mut ed.text_draft_size, 16.0..=160.0)
+                        .show_value(true)
+                        .clamping(egui::SliderClamping::Always),
+                );
+                if size.changed()
+                    && let Some(i) = ed.text_focus
+                    && let Some(t) = ed.texts.get_mut(i)
+                {
+                    t.size = ed.text_draft_size;
+                }
+            },
+        );
+
+        if theme::segmented_control(
+            ui,
+            &mut ed.text_draft_color,
+            &[
+                (TextColor::White, "白"),
+                (TextColor::Black, "黑"),
+                (TextColor::Yellow, "黄"),
+            ],
+        ) && let Some(i) = ed.text_focus
+            && let Some(t) = ed.texts.get_mut(i)
+        {
+            t.color = ed.text_draft_color;
+        }
+
+        if ui.button("放到中央").clicked() {
+            let (w, h) = ed.img_size();
+            ed.begin_text_at(w as f32 * 0.5, h as f32 * 0.5);
+        }
+        if ed.text_focus.is_some()
+            && ui.button("删文字").clicked()
+            && let Some(i) = ed.text_focus
+        {
+            ed.remove_text(i);
+        }
+        ui.label(
+            egui::RichText::new("点击添加，拖动可移动，再点一下编辑")
+                .size(13.0)
+                .color(p.text_secondary),
+        );
+    });
+}
+
 pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> EditorRequest {
     let mut request = EditorRequest::None;
     ed.clamp_focus();
 
-    if !ed.full_image && ed.boxes.len() > 1 {
+    ed.clamp_text_focus();
+    if !ui.ctx().egui_wants_keyboard_input() {
         let del = ui.input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
         });
         if del {
-            ed.remove_focused();
+            if let Some(i) = ed.text_focus {
+                ed.remove_text(i);
+            } else if !ed.full_image && ed.boxes.len() > 1 {
+                ed.remove_focused();
+            }
         }
     }
 
@@ -711,6 +1067,24 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
                     if orig_changed {
                         ed.dirty = true;
                     }
+                    ui.separator();
+                    if ui
+                        .add(egui::Button::new("文字").selected(ed.text_panel))
+                        .on_hover_text("文字模式：点击图片添加文字")
+                        .clicked()
+                    {
+                        ed.text_panel = !ed.text_panel;
+                        if ed.text_panel {
+                            if overlay_text::system_font().is_none() {
+                                request = EditorRequest::Toast(
+                                    ToastKind::Error,
+                                    "未找到系统中文字体，无法绘制文字".into(),
+                                );
+                            }
+                        } else {
+                            ed.commit_or_drop_focused();
+                        }
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::accent_button(ui, "保存图片").clicked() {
@@ -722,6 +1096,10 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
                     });
                 },
             );
+            if ed.text_panel {
+                ui.add_space(6.0);
+                show_text_bar(ui, ed);
+            }
         });
 
     egui::CentralPanel::default().show(ui, |ui| {
@@ -747,7 +1125,11 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
             .pointer_hover_pos()
             .map_or(egui::CursorIcon::Default, |pos| {
                 let pimg = view.to_image(pos);
-                if hit_boxes(pimg, &displayed, focus).is_some() {
+                if hit_texts(ed, pimg).is_some() {
+                    egui::CursorIcon::Move
+                } else if ed.placing_text() {
+                    egui::CursorIcon::Text
+                } else if hit_boxes(pimg, &displayed, focus).is_some() {
                     egui::CursorIcon::Move
                 } else if ed.full_image {
                     egui::CursorIcon::Default
@@ -762,9 +1144,30 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            let p = view.to_image(pos);
-            if let Some(i) = hit_boxes(p, &displayed, focus) {
-                ed.focus = i;
+            let on_editor = ed.text_editing
+                && ed
+                    .text_focus
+                    .and_then(|i| ed.texts.get(i))
+                    .is_some_and(|t| inline_text_rect(&view, t).contains(pos));
+            if !on_editor {
+                let p = view.to_image(pos);
+                if let Some(i) = hit_texts(ed, p) {
+                    if ed.text_focus == Some(i) {
+                        ed.text_editing = true;
+                        ed.text_need_focus = true;
+                        ed.text_panel = true;
+                    } else {
+                        ed.commit_or_drop_focused();
+                        ed.select_text(i);
+                    }
+                } else if ed.text_panel {
+                    ed.begin_text_at(p.0, p.1);
+                } else {
+                    ed.commit_or_drop_focused();
+                    if let Some(i) = hit_boxes(p, &displayed, focus) {
+                        ed.focus = i;
+                    }
+                }
             }
         }
 
@@ -786,6 +1189,7 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
             _ => None,
         };
         paint(ui, ed, &view, &displayed, hovered_handle, preview);
+        show_inline_editor(ui, ed, &view);
     });
 
     request
@@ -801,7 +1205,18 @@ fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displaye
         let p = view.to_image(pos);
         let tol = 10.0 / view.scale;
         if let Some(sel) = displayed.get(focus).copied() {
-            if let Some(h) = hit_handle(p, sel, tol) {
+            if let Some(i) = hit_texts(ed, p) {
+                if ed.text_focus != Some(i) {
+                    ed.commit_or_drop_focused();
+                    ed.select_text(i);
+                }
+                let t = &ed.texts[i];
+                ed.drag = DragMode::MoveText {
+                    index: i,
+                    grab_dx: p.0 - t.x,
+                    grab_dy: p.1 - t.y,
+                };
+            } else if let Some(h) = hit_handle(p, sel, tol) {
                 let b = &mut ed.boxes[focus];
                 b.anim = None;
                 b.rect = sel;
@@ -809,6 +1224,8 @@ fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displaye
                     index: focus,
                     handle: h,
                 };
+            } else if ed.placing_text() {
+                ed.drag = DragMode::Idle;
             } else if let Some(i) = hit_boxes(p, displayed, focus) {
                 ed.focus = i;
                 let sel_i = displayed[i];
@@ -899,6 +1316,21 @@ fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displaye
                 .normalized()
                 .clamped(img_w, img_h);
                 ed.drag = DragMode::NewBox { start, current };
+            }
+            DragMode::MoveText {
+                index,
+                grab_dx,
+                grab_dy,
+            } => {
+                if let Some(t) = ed.texts.get_mut(index) {
+                    let nx = (p.0 - grab_dx).clamp(0.0, img_w as f32);
+                    let ny = (p.1 - grab_dy).clamp(0.0, img_h as f32);
+                    if t.x != nx || t.y != ny {
+                        t.x = nx;
+                        t.y = ny;
+                        ed.dirty = true;
+                    }
+                }
             }
             DragMode::Idle => {}
         }
@@ -1045,6 +1477,43 @@ fn paint(
             egui::Color32::from_rgba_unmultiplied(p.accent.r(), p.accent.g(), p.accent.b(), 28);
         painter.rect_filled(sr, 0.0, fill);
         paint_axis(&painter, sr, 0.7);
+    }
+
+    if let Some(font) = overlay_text::system_font() {
+        for (i, t) in ed.texts.iter().enumerate() {
+            if ed.text_editing && ed.text_focus == Some(i) {
+                continue;
+            }
+            let Some((x0, y0, x1, y1)) = overlay_text::bounds(font, &t.text, t.x, t.y, t.size)
+            else {
+                continue;
+            };
+            let sr = egui::Rect::from_min_max(view.to_screen(x0, y0), view.to_screen(x1, y1))
+                .expand(3.0);
+            let focused = ed.text_focus == Some(i);
+            if focused {
+                painter.rect_stroke(
+                    sr,
+                    2.0,
+                    egui::Stroke::new(2.0, p.accent),
+                    egui::StrokeKind::Outside,
+                );
+                painter.text(
+                    sr.center_top() + egui::vec2(0.0, -4.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    "拖动移动 · 再点一下编辑",
+                    egui::FontId::proportional(12.0),
+                    p.accent,
+                );
+            } else {
+                painter.rect_stroke(
+                    sr,
+                    2.0,
+                    egui::Stroke::new(1.0, p.stroke_control),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
     }
 }
 
@@ -1266,5 +1735,81 @@ mod tests {
         ed.focus = 1;
         assert_eq!(ed.boxes[ed.focus].dir_pref, DirectionPref::Right);
         assert!(!ed.boxes[ed.focus].show_original);
+    }
+
+    #[test]
+    fn place_text_at_center_and_delete() {
+        let img = RgbaImage::new(80, 40);
+        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        ed.text_draft = "强".into();
+        ed.place_text(20.0, 10.0);
+        assert_eq!(ed.texts.len(), 1);
+        assert_eq!(ed.texts[0].x, 20.0);
+        assert_eq!(ed.text_focus, Some(0));
+        ed.remove_text(0);
+        assert!(ed.texts.is_empty());
+        assert!(ed.text_focus.is_none());
+    }
+
+    #[test]
+    fn begin_text_empty_drops_on_commit() {
+        let img = RgbaImage::new(80, 40);
+        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        ed.begin_text_at(20.0, 10.0);
+        assert_eq!(ed.texts.len(), 1);
+        assert!(ed.texts[0].text.is_empty());
+        assert!(ed.text_panel);
+        ed.commit_or_drop_focused();
+        assert!(ed.texts.is_empty());
+        assert!(ed.text_focus.is_none());
+    }
+
+    #[test]
+    fn select_text_keeps_it_and_allows_move() {
+        let img = RgbaImage::new(80, 40);
+        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        ed.text_draft = "强".into();
+        ed.place_text(20.0, 10.0);
+        ed.commit_or_drop_focused();
+        assert_eq!(ed.texts.len(), 1);
+        assert!(ed.text_focus.is_none());
+        ed.select_text(0);
+        assert_eq!(ed.text_focus, Some(0));
+        assert!(!ed.text_editing);
+        ed.texts[0].x = 50.0;
+        ed.texts[0].y = 18.0;
+        assert_eq!(ed.texts[0].x, 50.0);
+        assert_eq!(ed.texts[0].y, 18.0);
+        assert_eq!(ed.texts[0].text, "强");
+    }
+
+    #[test]
+    fn overlay_text_is_mirrored_like_pixels() {
+        let Some(_) = overlay_text::system_font() else {
+            eprintln!("skip: no system CJK font");
+            return;
+        };
+        let img = RgbaImage::from_pixel(100, 50, image::Rgba([0, 0, 0, 255]));
+        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        ed.boxes[0].dir_pref = DirectionPref::Left;
+        ed.text_draft = "Q".into();
+        ed.text_draft_size = 28.0;
+        ed.place_text(25.0, 25.0);
+        let out = ed.compose_result();
+        let left = (0..50u32)
+            .flat_map(|y| (0..50u32).map(move |x| (x, y)))
+            .filter(|&(x, y)| out.get_pixel(x, y).0[0] > 20)
+            .count();
+        assert!(left > 10, "text should paint the kept half, got {left} px");
+        for y in 0..50u32 {
+            for x in 50..100u32 {
+                let sx = 99 - x;
+                assert_eq!(
+                    out.get_pixel(x, y),
+                    out.get_pixel(sx, y),
+                    "pixel ({x},{y}) should mirror ({sx},{y})"
+                );
+            }
+        }
     }
 }
