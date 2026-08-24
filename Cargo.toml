@@ -20,6 +20,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Ole",
 ] }
 
+[build-dependencies]
+sha2 = "0.10"
+
 [profile.release]
 lto = true
 codegen-units = 1

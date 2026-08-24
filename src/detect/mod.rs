@@ -29,12 +29,12 @@ impl Face {
     }
 }
 
-/// SCRFD 检测器。模型字节编译期内嵌，构造即可用，运行时无 IO。
+/// SCRFD 检测器。构建期从 Hugging Face 拉取 buffalo_l `det_10g.onnx` 后内嵌，运行时无 IO。
 pub struct FaceDetector {
     model: rten::Model,
 }
 
-static MODEL_BYTES: &[u8] = include_bytes!("../../assets/scrfd_2.5g_bnkps.onnx");
+static MODEL_BYTES: &[u8] = include_bytes!("../../assets/det_10g.onnx");
 
 impl FaceDetector {
     pub fn new() -> Result<Self> {

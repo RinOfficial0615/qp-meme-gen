@@ -1,4 +1,5 @@
-//! SCRFD 2.5G (bnkps) 推理实现：letterbox 预处理、anchor 解码、NMS。
+//! SCRFD 推理：letterbox 预处理、anchor 解码、NMS。
+//! 默认权重是 InsightFace buffalo_l 的 SCRFD-10GF（`det_10g.onnx`，5 关键点）。
 //! 仅供 `detect::FaceDetector` 内部使用。
 
 use anyhow::{Context, Result, anyhow, bail};

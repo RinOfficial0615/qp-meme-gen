@@ -1,6 +1,6 @@
 # 架构
 
-运行时无网络、无遥测。SCRFD 模型以 `include_bytes!` 编进二进制，`rten::Model::load_static_slice` 加载。
+运行时无网络、无遥测。人脸模型在 **构建期** 从 Hugging Face 下载，再以 `include_bytes!` 编进二进制，`rten::Model::load_static_slice` 加载。
 
 ```
 src/
@@ -10,10 +10,12 @@ src/
   config.rs         exe 旁 qp-meme-gen.toml
   clipboard.rs      Windows 读图（对齐 Chromium clipboard_win.cc）
   core/mirror.rs    镜像纯函数
+  core/text.rs      叠加文字：排版、描边、画进 RGBA
   detect/           FaceDetector 门面 + SCRFD
   ui/               主页、编辑器、设置、主题、toast
 assets/
-  scrfd_2.5g_bnkps.onnx
+  det_10g.onnx      构建脚本下载，不进 git
+build.rs            Hugging Face 下载 + sha256 校验
 ```
 
 `main.rs` 只做薄壳。测试走 crate 模块，不依赖 GUI 进程。
@@ -31,6 +33,12 @@ assets/
 
 自动方向不比较接缝（镜像后轴两侧必然同源，违和度恒零），改为比较保留半区的水平梯度能量，隔行采样；打平取左。
 
+## 叠加文字
+
+`core::text` 用系统 CJK 字体（`msyh.ttc` → `simhei.ttf` → `simsun.ttc`）把字符串画到 RGBA。中心点 `(cx, cy)`，8 方向描边后再填内部。
+
+编辑器合成顺序：克隆源图 → 逐条 `draw`（正在输入的那条跳过）→ 再对每个选框做 `mirror`。因此框内文字与照片一起左右翻转，而不是画在镜像结果上面。
+
 ## 人脸框
 
 双眼中点为轴心，左右对称扩张覆盖 bbox，左右各外扩约 10%，顶部多扩。越界钳制到图像范围。
@@ -39,7 +47,9 @@ assets/
 
 ## SCRFD
 
-InsightFace `scrfd_2.5g_bnkps`（5 关键点）。
+InsightFace 1.0 没有换检测架构，仍是 SCRFD。Python 包默认模型包是 **buffalo_l**，其中检测器为 **SCRFD-10GF**（`det_10g.onnx`，5 关键点）。独立发布的 `scrfd_2.5g_bnkps.onnx` 是同一家族的小模型，不在 buffalo 包里，Hugging Face `deepghs/insightface` 也不提供。
+
+本仓库构建时从该镜像拉取 `buffalo_l/det_10g.onnx`。I/O 与 2.5G bnkps 同族：letterbox 到 640×640 时三个 stride 的行数为 12800 / 3200 / 800，每行 score 1、bbox 4、kps 10。buffalo 导出是动态空间维、输出名为数字节点；解码按列数和行数归类，不依赖 `score_8` 这类名字。
 
 - letterbox 到 640×640，114 灰边，`(x-127.5)/128`，RGB，NCHW
 - stride `{8,16,32}` × 2 anchors
@@ -60,4 +70,4 @@ egui-winit 在剪贴板无文本时会吞掉 Ctrl+V 按下。粘贴命令由 `Ev
 
 WinUI 3 浅/深双色板。选项类控件：未选中灰边，选中或悬停强调色边。人脸/整图/加框带 250ms ease-out。主页 ↔ 编辑器淡入+水平滑入。Toast 底部独立定位，淡出时收掉占位高度。
 
-中文字体启动时按序尝试 `msyh.ttc` / `simhei.ttf` / `simsun.ttc`。
+界面中文字体启动时按序尝试 `msyh.ttc` / `simhei.ttf` / `simsun.ttc`，与叠加文字同一套候选。

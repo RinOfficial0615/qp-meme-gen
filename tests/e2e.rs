@@ -1,4 +1,4 @@
-//! 端到端：内嵌 SCRFD 模型在真实图片上检出人脸；镜像输出尺寸不变且对称。
+//! 端到端：内嵌 SCRFD-10GF 在真实图片上检出人脸；镜像输出尺寸不变且对称。
 
 use image::RgbaImage;
 use qp_meme_gen::core::mirror::{self, Direction, Rect};
