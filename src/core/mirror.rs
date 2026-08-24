@@ -121,6 +121,18 @@ pub fn mirror_regions(img: &RgbaImage, regions: &[(Rect, Direction)]) -> RgbaIma
     out
 }
 
+/// 裁出选框内像素，输出尺寸为框的宽高。空框则原样返回。
+pub fn crop_to_rect(img: &RgbaImage, sel: Rect) -> RgbaImage {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let sel = sel.normalized().clamped(w, h);
+    let bw = sel.width().max(0) as u32;
+    let bh = sel.height().max(0) as u32;
+    if bw == 0 || bh == 0 {
+        return img.clone();
+    }
+    image::imageops::crop_imm(img, sel.x0 as u32, sel.y0 as u32, bw, bh).to_image()
+}
+
 /// 把 `src` 的选框区域复制到 `dst`（用于某框「查看原图」覆盖先前镜像）。
 pub fn copy_rect(dst: &mut RgbaImage, src: &RgbaImage, sel: Rect) {
     let (w, h) = (src.width() as i32, src.height() as i32);
@@ -328,5 +340,21 @@ mod tests {
         copy_rect(&mut out, &img, Rect::new(4, 0, 8, 2));
         assert_eq!(out.get_pixel(6, 0).0[0], 6);
         assert_eq!(out.get_pixel(1, 0).0[0], 1);
+    }
+
+    #[test]
+    fn crop_to_rect_extracts_region() {
+        let img = coord_image(10, 8);
+        let out = crop_to_rect(&img, Rect::new(2, 3, 6, 7));
+        assert_eq!(out.dimensions(), (4, 4));
+        assert_eq!(out.get_pixel(0, 0).0, [2, 3, 0, 255]);
+        assert_eq!(out.get_pixel(3, 3).0, [5, 6, 0, 255]);
+    }
+
+    #[test]
+    fn crop_to_rect_empty_is_clone() {
+        let img = coord_image(4, 4);
+        let out = crop_to_rect(&img, Rect::new(1, 1, 1, 3));
+        assert_eq!(out.dimensions(), img.dimensions());
     }
 }

@@ -11,7 +11,7 @@
 - 多处框选：每框独立方向与「查看原图」；「显示角标」控制角上编号；加框按未框住的最高分人脸，没有则放画面中央（宽高各 40%）
 - 翻转方向：自动 / 保留左半 / 保留右半
 - 叠加文字：点工具栏「文字」，再点画面添加；字号、白/黑/黄/红；拖动移动，再点一次进入编辑。文字随选框一起镜像
-- 复制到剪贴板或另存为图片
+- 复制到剪贴板或另存为图片；单框时可勾「仅框选处」（默认开）只导出框内
 - WinUI 3 风格浅色 / 深色 / 跟随系统
 
 ## 构建
@@ -51,6 +51,7 @@ exe 同目录 `qp-meme-gen.toml`。主页设置里改动会立刻写入。读失
 ```toml
 default_crop_mode = "single"   # "single" | "multi" | "full"
 default_direction = "auto"     # "left" | "right" | "auto"
+default_crop_export = true     # 单框时复制/保存只留框内
 appearance = "system"          # "system" | "light" | "dark"
 ```
 

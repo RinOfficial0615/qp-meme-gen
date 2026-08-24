@@ -108,7 +108,7 @@ pub fn show(ui: &mut egui::Ui, cfg: &mut Config) -> HomeAction {
                 ui.cursor().min.x + (ui.available_width() - settings_w) / 2.0,
                 ui.cursor().min.y,
             ),
-            egui::vec2(settings_w, 200.0),
+            egui::vec2(settings_w, 236.0),
         );
         let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(settings_rect));
         theme::card_frame(ui.ctx()).show(&mut card_ui, |ui| {

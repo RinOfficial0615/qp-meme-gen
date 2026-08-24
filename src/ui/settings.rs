@@ -1,4 +1,4 @@
-//! 设置面板：默认框选模式 + 默认翻转方向 + 外观。返回值 = 配置是否被改动。
+//! 设置面板：默认框选模式、翻转方向、仅框选处、外观。返回值 = 配置是否被改动。
 
 use eframe::egui;
 
@@ -68,6 +68,11 @@ pub fn show(ui: &mut egui::Ui, cfg: &mut Config) -> bool {
                         "保留右半",
                     );
                 });
+            ui.end_row();
+
+            ui.label("默认仅保留框选处：");
+            let _ = theme::accent_checkbox(ui, &mut cfg.default_crop_export, "开启")
+                .on_hover_text("打开图片后，单框时复制和保存只保留选框内的画面");
             ui.end_row();
 
             ui.label("外观：");

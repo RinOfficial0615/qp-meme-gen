@@ -111,6 +111,8 @@ pub struct Editor {
     text_editing: bool,
     /// 多人框时是否画角上编号。小框会被挡住，可关掉。
     show_badges: bool,
+    /// 仅一个框时：复制/保存只保留框内。多框时忽略。
+    crop_export: bool,
 }
 
 fn lerp_i32(a: i32, b: i32, t: f32) -> i32 {
@@ -126,7 +128,12 @@ fn tiny_of(r: Rect, img_w: i32, img_h: i32) -> Rect {
 }
 
 impl Editor {
-    pub fn new(img: RgbaImage, path: Option<PathBuf>, dir_pref: DirectionPref) -> Self {
+    pub fn new(
+        img: RgbaImage,
+        path: Option<PathBuf>,
+        dir_pref: DirectionPref,
+        crop_export: bool,
+    ) -> Self {
         let (img_w, img_h) = (img.width(), img.height());
         let rect = Rect::new(0, 0, img_w as i32, img_h as i32);
         Self {
@@ -158,6 +165,7 @@ impl Editor {
             text_need_focus: false,
             text_editing: false,
             show_badges: true,
+            crop_export,
         }
     }
 
@@ -300,6 +308,16 @@ impl Editor {
     /// 文字先画到源图，再按选框镜像，效果与照片像素相同。
     fn compose_result(&self) -> RgbaImage {
         self.compose_skipping(None)
+    }
+
+    /// 复制/保存用：单框且勾了「仅框选处」时裁到框内，否则整图。
+    fn export_image(&self) -> RgbaImage {
+        let out = self.compose_result();
+        if self.crop_export && self.boxes.len() == 1 {
+            mirror::crop_to_rect(&out, self.boxes[0].rect)
+        } else {
+            out
+        }
     }
 
     fn compose_skipping(&self, skip: Option<usize>) -> RgbaImage {
@@ -529,7 +547,7 @@ impl Editor {
     }
 
     fn save_as(&self) -> EditorRequest {
-        let out = self.compose_result();
+        let out = self.export_image();
         let default_name = self
             .path
             .as_ref()
@@ -552,7 +570,7 @@ impl Editor {
     }
 
     fn copy_to_clipboard(&self) -> EditorRequest {
-        let out = self.compose_result();
+        let out = self.export_image();
         let data = arboard::ImageData {
             width: out.width() as usize,
             height: out.height() as usize,
@@ -703,6 +721,10 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
                         if ui.button("复制图片").clicked() {
                             request = ed.copy_to_clipboard();
                         }
+                        if ed.boxes.len() == 1 {
+                            let _ = theme::accent_checkbox(ui, &mut ed.crop_export, "仅框选处")
+                                .on_hover_text("复制和保存只保留选框内的画面");
+                        }
                     });
                 },
             );
@@ -767,7 +789,7 @@ mod tests {
     #[test]
     fn face_select_without_faces_uses_center_not_full() {
         let img = RgbaImage::new(200, 100);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
         assert!(ed.is_full_image());
         ed.apply_face_boxes(&[]);
         assert!(!ed.is_full_image());
@@ -778,7 +800,7 @@ mod tests {
     #[test]
     fn face_boxes_roundtrip_reuses_cache() {
         let img = RgbaImage::new(200, 200);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
         let f_hi = face([20.0, 20.0, 60.0, 60.0], 0.99);
         let f_lo = face([120.0, 20.0, 160.0, 60.0], 0.7);
         ed.apply_face_boxes(&[f_hi, f_lo]);
@@ -797,7 +819,7 @@ mod tests {
     #[test]
     fn cached_face_boxes_single_picks_largest() {
         let img = RgbaImage::new(200, 200);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
         let f_hi = face([20.0, 20.0, 80.0, 80.0], 0.9);
         let f_lo = face([120.0, 20.0, 150.0, 50.0], 0.8);
         ed.set_faces(vec![f_hi, f_lo]);
@@ -809,7 +831,7 @@ mod tests {
     #[test]
     fn apply_cached_face_boxes_noop_without_cache() {
         let img = RgbaImage::new(80, 80);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
         assert!(!ed.faces_cached());
         assert!(!ed.apply_cached_face_boxes(true));
         assert!(ed.is_full_image());
@@ -818,7 +840,7 @@ mod tests {
     #[test]
     fn full_image_rejects_add_box() {
         let img = RgbaImage::new(80, 80);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
         assert!(ed.is_full_image());
         assert_eq!(ed.boxes.len(), 1);
         ed.add_box();
@@ -828,7 +850,7 @@ mod tests {
     #[test]
     fn add_box_picks_highest_unused_then_center() {
         let img = RgbaImage::new(200, 200);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
         let f_hi = face([20.0, 20.0, 60.0, 60.0], 0.99);
         let f_lo = face([120.0, 20.0, 160.0, 60.0], 0.7);
         ed.apply_face_boxes(&[f_hi]);
@@ -846,7 +868,7 @@ mod tests {
     #[test]
     fn per_box_direction_and_original_are_independent() {
         let img = RgbaImage::new(120, 120);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
         ed.apply_face_boxes(&[
             face([10.0, 10.0, 50.0, 50.0], 0.9),
             face([70.0, 10.0, 110.0, 50.0], 0.8),
@@ -867,7 +889,7 @@ mod tests {
     #[test]
     fn place_text_at_center_and_delete() {
         let img = RgbaImage::new(80, 40);
-        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
         ed.text_draft = "强".into();
         ed.place_text(20.0, 10.0);
         assert_eq!(ed.texts.len(), 1);
@@ -881,7 +903,7 @@ mod tests {
     #[test]
     fn begin_text_empty_drops_on_commit() {
         let img = RgbaImage::new(80, 40);
-        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
         ed.begin_text_at(20.0, 10.0);
         assert_eq!(ed.texts.len(), 1);
         assert!(ed.texts[0].text.is_empty());
@@ -894,7 +916,7 @@ mod tests {
     #[test]
     fn select_text_keeps_it_and_allows_move() {
         let img = RgbaImage::new(80, 40);
-        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
         ed.text_draft = "强".into();
         ed.place_text(20.0, 10.0);
         ed.commit_or_drop_focused();
@@ -917,7 +939,7 @@ mod tests {
             return;
         };
         let img = RgbaImage::from_pixel(80, 80, image::Rgba([0, 0, 0, 255]));
-        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
         ed.boxes[0].dir_pref = DirectionPref::Left;
         ed.boxes[0].show_original = true;
         ed.text_draft = "Q".into();
@@ -943,7 +965,7 @@ mod tests {
             return;
         };
         let img = RgbaImage::from_pixel(100, 50, image::Rgba([0, 0, 0, 255]));
-        let mut ed = Editor::new(img, None, DirectionPref::Left);
+        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
         ed.boxes[0].dir_pref = DirectionPref::Left;
         ed.text_draft = "Q".into();
         ed.text_draft_size = 28.0;
@@ -964,5 +986,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn export_crops_single_box_when_enabled() {
+        let img = RgbaImage::from_fn(100, 80, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
+        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
+        ed.apply_face_boxes(&[]);
+        assert_eq!(ed.boxes.len(), 1);
+        assert!(ed.crop_export);
+        let r = ed.boxes[0].rect;
+        let full = ed.compose_result();
+        let out = ed.export_image();
+        assert_eq!(out.width() as i32, r.width());
+        assert_eq!(out.height() as i32, r.height());
+        assert_eq!(
+            out.get_pixel(0, 0),
+            full.get_pixel(r.x0 as u32, r.y0 as u32)
+        );
+    }
+
+    #[test]
+    fn export_keeps_full_when_crop_disabled() {
+        let img = RgbaImage::new(100, 80);
+        let mut ed = Editor::new(img, None, DirectionPref::Left, false);
+        ed.apply_face_boxes(&[]);
+        let out = ed.export_image();
+        assert_eq!(out.dimensions(), (100, 80));
+    }
+
+    #[test]
+    fn export_keeps_full_with_multiple_boxes() {
+        let img = RgbaImage::new(200, 200);
+        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([70.0, 10.0, 110.0, 50.0], 0.8),
+        ]);
+        assert_eq!(ed.boxes.len(), 2);
+        assert!(ed.crop_export);
+        let out = ed.export_image();
+        assert_eq!(out.dimensions(), (200, 200));
     }
 }

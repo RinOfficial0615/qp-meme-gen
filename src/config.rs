@@ -49,6 +49,7 @@ pub struct Config {
     pub default_crop_mode: CropMode,
     pub default_direction: DirectionPref,
     pub appearance: Appearance,
+    pub default_crop_export: bool,
 }
 
 impl Default for Config {
@@ -57,6 +58,7 @@ impl Default for Config {
             default_crop_mode: CropMode::Single,
             default_direction: DirectionPref::Auto,
             appearance: Appearance::System,
+            default_crop_export: true,
         }
     }
 }
@@ -92,6 +94,7 @@ mod tests {
             default_crop_mode: CropMode::Full,
             default_direction: DirectionPref::Right,
             appearance: Appearance::Dark,
+            default_crop_export: false,
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
@@ -104,6 +107,7 @@ mod tests {
         assert_eq!(cfg.default_direction, DirectionPref::Left);
         assert_eq!(cfg.default_crop_mode, CropMode::Single);
         assert_eq!(cfg.appearance, Appearance::System);
+        assert!(cfg.default_crop_export);
     }
 
     #[test]

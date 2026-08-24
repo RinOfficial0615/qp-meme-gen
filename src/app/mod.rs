@@ -135,7 +135,12 @@ impl QpApp {
     /// 统一的"进入编辑器"路径：设置初始框、刷新结果、切屏。
     fn enter_editor(&mut self, ctx: &egui::Context, img: RgbaImage, path: Option<PathBuf>) {
         let from_home = matches!(self.screen, Screen::Home);
-        let mut ed = editor::Editor::new(img, path, self.config.default_direction);
+        let mut ed = editor::Editor::new(
+            img,
+            path,
+            self.config.default_direction,
+            self.config.default_crop_export,
+        );
         match self.config.default_crop_mode {
             CropMode::Full => {}
             CropMode::Single | CropMode::Multi => {
