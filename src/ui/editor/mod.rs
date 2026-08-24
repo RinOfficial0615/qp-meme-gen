@@ -1,4 +1,4 @@
-//! 编辑器：状态、工具栏、画布/文字栏的编排。
+//! 编辑器：状态、多选工具栏、画布/文字栏的编排。
 //! 选框几何在 `core::crop`；命中与绘制在 `canvas`；文字栏在 `overlay`。
 
 mod canvas;
@@ -11,9 +11,8 @@ use std::time::Instant;
 use eframe::egui;
 use image::RgbaImage;
 
-use crate::config::DirectionPref;
 use crate::core::crop::{self, MIN_BOX};
-use crate::core::mirror::{self, Direction, Rect};
+use crate::core::mirror::{self, KeepSide, MirrorAxis, Rect};
 use crate::core::text as overlay_text;
 use crate::detect::Face;
 use crate::ui::theme;
@@ -44,10 +43,45 @@ struct BoxAnim {
 struct CropBox {
     id: u64,
     rect: Rect,
-    dir_pref: DirectionPref,
+    axis: MirrorAxis,
+    keep_side: KeepSide,
     show_original: bool,
+    show_badge: bool,
     anim: Option<BoxAnim>,
 }
+
+#[derive(Clone, PartialEq)]
+struct BoxSnapshot {
+    id: u64,
+    rect: Rect,
+    axis: MirrorAxis,
+    keep_side: KeepSide,
+    show_original: bool,
+    show_badge: bool,
+}
+
+#[derive(Clone, PartialEq)]
+struct TextSnapshot {
+    id: u64,
+    text: String,
+    x: f32,
+    y: f32,
+    size: f32,
+    color: TextColor,
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct EditorSnapshot {
+    boxes: Vec<BoxSnapshot>,
+    focus: usize,
+    selected_ids: Vec<u64>,
+    next_id: u64,
+    full_image: bool,
+    texts: Vec<TextSnapshot>,
+    crop_export: bool,
+}
+
+const HISTORY_LIMIT: usize = 100;
 
 impl CropBox {
     fn displayed(&self) -> Rect {
@@ -89,12 +123,14 @@ pub struct Editor {
     path: Option<PathBuf>,
     boxes: Vec<CropBox>,
     focus: usize,
+    selected_ids: Vec<u64>,
     next_id: u64,
     /// 整图框选模式：不允许加框。
     full_image: bool,
     /// 最近一次检测结果；`None` = 尚未检测。
     faces: Option<Vec<Face>>,
-    default_dir: DirectionPref,
+    default_axis: MirrorAxis,
+    default_keep_side: KeepSide,
     original_tex: Option<egui::TextureHandle>,
     result_tex: Option<egui::TextureHandle>,
     result_img: Option<RgbaImage>,
@@ -109,10 +145,14 @@ pub struct Editor {
     text_need_focus: bool,
     /// 正在输入。选中但未进入输入时只显示选框，可拖动改位置。
     text_editing: bool,
-    /// 多人框时是否画角上编号。小框会被挡住，可关掉。
-    show_badges: bool,
     /// 仅一个框时：复制/保存只保留框内。多框时忽略。
     crop_export: bool,
+    undo_stack: Vec<EditorSnapshot>,
+    redo_stack: Vec<EditorSnapshot>,
+    history_gesture: Option<EditorSnapshot>,
+    history_gesture_text_continuation: bool,
+    text_history_before: Option<EditorSnapshot>,
+    text_style_history_before: Option<EditorSnapshot>,
 }
 
 fn lerp_i32(a: i32, b: i32, t: f32) -> i32 {
@@ -131,7 +171,8 @@ impl Editor {
     pub fn new(
         img: RgbaImage,
         path: Option<PathBuf>,
-        dir_pref: DirectionPref,
+        axis: MirrorAxis,
+        keep_side: KeepSide,
         crop_export: bool,
     ) -> Self {
         let (img_w, img_h) = (img.width(), img.height());
@@ -142,15 +183,19 @@ impl Editor {
             boxes: vec![CropBox {
                 id: 1,
                 rect,
-                dir_pref,
+                axis,
+                keep_side: keep_side.normalized_for_axis(axis),
                 show_original: false,
+                show_badge: true,
                 anim: None,
             }],
             focus: 0,
+            selected_ids: vec![1],
             next_id: 2,
             full_image: true,
             faces: None,
-            default_dir: dir_pref,
+            default_axis: axis,
+            default_keep_side: keep_side.normalized_for_axis(axis),
             original_tex: None,
             result_tex: None,
             result_img: None,
@@ -164,8 +209,13 @@ impl Editor {
             text_draft_color: TextColor::White,
             text_need_focus: false,
             text_editing: false,
-            show_badges: true,
             crop_export,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            history_gesture: None,
+            history_gesture_text_continuation: false,
+            text_history_before: None,
+            text_style_history_before: None,
         }
     }
 
@@ -216,6 +266,404 @@ impl Editor {
         (self.img.width() as i32, self.img.height() as i32)
     }
 
+    pub(super) fn snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot {
+            boxes: self
+                .boxes
+                .iter()
+                .map(|b| BoxSnapshot {
+                    id: b.id,
+                    rect: b.rect,
+                    axis: b.axis,
+                    keep_side: b.keep_side,
+                    show_original: b.show_original,
+                    show_badge: b.show_badge,
+                })
+                .collect(),
+            focus: self.focus,
+            selected_ids: self.selected_ids.clone(),
+            next_id: self.next_id,
+            full_image: self.full_image,
+            texts: self
+                .texts
+                .iter()
+                .map(|t| TextSnapshot {
+                    id: t.id,
+                    text: t.text.clone(),
+                    x: t.x,
+                    y: t.y,
+                    size: t.size,
+                    color: t.color,
+                })
+                .collect(),
+            crop_export: self.crop_export,
+        }
+    }
+
+    fn snapshot_changes_result(a: &EditorSnapshot, b: &EditorSnapshot) -> bool {
+        a.full_image != b.full_image
+            || a.boxes.len() != b.boxes.len()
+            || a.boxes.iter().zip(&b.boxes).any(|(x, y)| {
+                x.id != y.id
+                    || x.rect != y.rect
+                    || x.axis != y.axis
+                    || x.keep_side != y.keep_side
+                    || x.show_original != y.show_original
+            })
+            || a.texts != b.texts
+    }
+
+    fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
+        let current = self.snapshot();
+        let result_changed = Self::snapshot_changes_result(&current, &snapshot);
+        self.boxes = snapshot
+            .boxes
+            .into_iter()
+            .map(|b| CropBox {
+                id: b.id,
+                rect: b.rect,
+                axis: b.axis,
+                keep_side: b.keep_side,
+                show_original: b.show_original,
+                show_badge: b.show_badge,
+                anim: None,
+            })
+            .collect();
+        self.focus = snapshot.focus;
+        self.selected_ids = snapshot.selected_ids;
+        self.next_id = snapshot.next_id;
+        self.full_image = snapshot.full_image;
+        self.texts = snapshot
+            .texts
+            .into_iter()
+            .map(|t| TextOverlay {
+                id: t.id,
+                text: t.text,
+                x: t.x,
+                y: t.y,
+                size: t.size,
+                color: t.color,
+            })
+            .collect();
+        self.crop_export = snapshot.crop_export;
+        self.drag = DragMode::Idle;
+        self.text_focus = None;
+        self.text_need_focus = false;
+        self.text_editing = false;
+        self.text_history_before = None;
+        self.text_style_history_before = None;
+        self.history_gesture = None;
+        self.history_gesture_text_continuation = false;
+        if result_changed {
+            self.result_tex = None;
+            self.result_img = None;
+            self.dirty = true;
+        }
+        self.clamp_focus();
+    }
+
+    fn commit_history_before(&mut self, before: EditorSnapshot) {
+        let after = self.snapshot();
+        if before == after {
+            return;
+        }
+        self.undo_stack.push(before);
+        if self.undo_stack.len() > HISTORY_LIMIT {
+            let excess = self.undo_stack.len() - HISTORY_LIMIT;
+            self.undo_stack.drain(0..excess);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn record_change(&mut self, f: impl FnOnce(&mut Self)) {
+        if self.history_gesture.is_some() {
+            f(self);
+            return;
+        }
+        let before = self.snapshot();
+        f(self);
+        self.commit_history_before(before);
+    }
+
+    pub(super) fn begin_history_gesture(&mut self) {
+        if self.history_gesture.is_none() {
+            self.history_gesture_text_continuation = self.text_history_before.is_some();
+            self.history_gesture = Some(
+                self.text_history_before
+                    .take()
+                    .unwrap_or_else(|| self.snapshot()),
+            );
+        }
+    }
+
+    pub(super) fn finish_history_gesture(&mut self) {
+        if let Some(before) = self.history_gesture.take() {
+            self.commit_history_before(before);
+            if self.history_gesture_text_continuation && self.text_editing {
+                self.text_history_before = Some(self.snapshot());
+            }
+        }
+        self.history_gesture_text_continuation = false;
+    }
+
+    pub(super) fn cancel_history_gesture(&mut self) {
+        if let Some(before) = self.history_gesture.take() {
+            self.restore_snapshot(before);
+        }
+        self.history_gesture_text_continuation = false;
+    }
+
+    pub(super) fn prepare_history_command(&mut self) {
+        if self.history_gesture.is_some() {
+            self.cancel_history_gesture();
+        }
+        if self.text_history_before.is_some() {
+            self.commit_or_drop_focused();
+        }
+        self.finish_text_style_history();
+    }
+
+    pub(super) fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub(super) fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub(crate) fn reset_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.history_gesture = None;
+        self.history_gesture_text_continuation = false;
+        self.text_history_before = None;
+        self.text_style_history_before = None;
+    }
+
+    pub(super) fn undo(&mut self) {
+        self.prepare_history_command();
+        let Some(previous) = self.undo_stack.pop() else {
+            return;
+        };
+        self.redo_stack.push(self.snapshot());
+        self.restore_snapshot(previous);
+    }
+
+    pub(super) fn redo(&mut self) {
+        self.prepare_history_command();
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        self.undo_stack.push(self.snapshot());
+        self.restore_snapshot(next);
+    }
+
+    pub(super) fn begin_text_style_history(&mut self, frame_before: EditorSnapshot) {
+        if self.text_style_history_before.is_none() {
+            self.text_style_history_before =
+                Some(self.text_history_before.clone().unwrap_or(frame_before));
+        }
+    }
+
+    pub(super) fn finish_text_style_history(&mut self) {
+        if let Some(before) = self.text_style_history_before.take() {
+            self.commit_history_before(before);
+            // 文字仍在编辑时，保留样式提交后的新基线，后续输入文字继续作为
+            // 下一条历史，而不是因为样式操作消费掉整段编辑的起点。
+            if self.text_editing && self.text_history_before.is_some() {
+                self.text_history_before = Some(self.snapshot());
+            }
+        }
+    }
+
+    fn selected_id_set_contains(&self, id: u64) -> bool {
+        self.selected_ids.contains(&id)
+    }
+
+    pub(super) fn is_selected_index(&self, index: usize) -> bool {
+        self.boxes
+            .get(index)
+            .is_some_and(|b| self.selected_id_set_contains(b.id))
+    }
+
+    pub(super) fn selected_count(&self) -> usize {
+        self.selected_indices().len()
+    }
+
+    pub(super) fn has_selection(&self) -> bool {
+        self.selected_count() > 0
+    }
+
+    /// 返回按画面层级顺序排列的当前选中框索引。
+    fn selected_indices(&self) -> Vec<usize> {
+        self.boxes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| self.selected_id_set_contains(b.id).then_some(i))
+            .collect()
+    }
+
+    fn clear_selection_raw(&mut self) {
+        self.selected_ids.clear();
+    }
+
+    pub(super) fn clear_selection(&mut self) {
+        self.record_change(|ed| ed.clear_selection_raw());
+    }
+
+    fn select_only_raw(&mut self, index: usize) {
+        if index >= self.boxes.len() {
+            return;
+        }
+        self.selected_ids.clear();
+        self.selected_ids.push(self.boxes[index].id);
+        self.focus = index;
+    }
+
+    pub(super) fn select_only(&mut self, index: usize) {
+        self.record_change(|ed| ed.select_only_raw(index));
+    }
+
+    pub(super) fn toggle_selection(&mut self, index: usize) {
+        self.record_change(|ed| ed.toggle_selection_raw(index));
+    }
+
+    fn toggle_selection_raw(&mut self, index: usize) {
+        if index >= self.boxes.len() {
+            return;
+        }
+        let id = self.boxes[index].id;
+        if let Some(pos) = self
+            .selected_ids
+            .iter()
+            .position(|&selected| selected == id)
+        {
+            self.selected_ids.remove(pos);
+            if self.selected_ids.is_empty() {
+                self.focus = index;
+            } else if self.focus == index {
+                self.focus = self
+                    .boxes
+                    .iter()
+                    .position(|b| self.selected_id_set_contains(b.id))
+                    .unwrap_or(self.focus);
+            }
+        } else {
+            self.selected_ids.push(id);
+            self.focus = index;
+        }
+    }
+
+    fn select_all_raw(&mut self) {
+        self.selected_ids = self.boxes.iter().map(|b| b.id).collect();
+        if !self.boxes.is_empty() {
+            self.focus = self.focus.min(self.boxes.len() - 1);
+        }
+    }
+
+    pub(super) fn select_all(&mut self) {
+        self.record_change(|ed| ed.select_all_raw());
+    }
+
+    fn selection_same<T: Copy + PartialEq>(&self, f: impl Fn(&CropBox) -> T) -> Option<T> {
+        let mut it = self.selected_indices().into_iter();
+        let first = it.next().and_then(|i| self.boxes.get(i)).map(&f)?;
+        if it.all(|i| self.boxes.get(i).is_some_and(|b| f(b) == first)) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    fn selection_bool_state(&self, f: impl Fn(&CropBox) -> bool) -> Option<bool> {
+        let indices = self.selected_indices();
+        let first = indices.first().and_then(|&i| self.boxes.get(i)).map(&f)?;
+        if indices
+            .iter()
+            .all(|&i| self.boxes.get(i).is_some_and(|b| f(b) == first))
+        {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn selected_axis(&self) -> Option<MirrorAxis> {
+        self.selection_same(|b| b.axis)
+    }
+
+    pub(super) fn selected_keep_side(&self) -> Option<KeepSide> {
+        self.selection_same(|b| b.keep_side)
+    }
+
+    pub(super) fn selected_show_original(&self) -> Option<bool> {
+        self.selection_bool_state(|b| b.show_original)
+    }
+
+    pub(super) fn selected_show_badge(&self) -> Option<bool> {
+        self.selection_bool_state(|b| b.show_badge)
+    }
+
+    fn apply_axis_to_selection_raw(&mut self, axis: MirrorAxis) {
+        let ids = self.selected_ids.clone();
+        for b in &mut self.boxes {
+            if ids.contains(&b.id) {
+                b.axis = axis;
+                b.keep_side = b.keep_side.normalized_for_axis(axis);
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn apply_axis_to_selection(&mut self, axis: MirrorAxis) {
+        self.record_change(|ed| ed.apply_axis_to_selection_raw(axis));
+    }
+
+    fn apply_keep_side_to_selection_raw(&mut self, side: KeepSide) {
+        let ids = self.selected_ids.clone();
+        for b in &mut self.boxes {
+            if ids.contains(&b.id) {
+                b.keep_side = side.normalized_for_axis(b.axis);
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn apply_keep_side_to_selection(&mut self, side: KeepSide) {
+        self.record_change(|ed| ed.apply_keep_side_to_selection_raw(side));
+    }
+
+    fn apply_show_original_to_selection_raw(&mut self, value: bool) {
+        let ids = self.selected_ids.clone();
+        for b in &mut self.boxes {
+            if ids.contains(&b.id) {
+                b.show_original = value;
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn apply_show_original_to_selection(&mut self, value: bool) {
+        self.record_change(|ed| ed.apply_show_original_to_selection_raw(value));
+    }
+
+    fn apply_show_badge_to_selection_raw(&mut self, value: bool) {
+        let ids = self.selected_ids.clone();
+        for b in &mut self.boxes {
+            if ids.contains(&b.id) {
+                b.show_badge = value;
+            }
+        }
+    }
+
+    pub(super) fn apply_show_badge_to_selection(&mut self, value: bool) {
+        self.record_change(|ed| ed.apply_show_badge_to_selection_raw(value));
+    }
+
+    pub(super) fn set_crop_export(&mut self, value: bool) {
+        self.record_change(|ed| ed.crop_export = value);
+    }
+
     fn placing_text(&self) -> bool {
         self.text_panel
     }
@@ -264,6 +712,7 @@ impl Editor {
 
     fn begin_text_at(&mut self, x: f32, y: f32) {
         self.commit_or_drop_focused();
+        self.text_history_before = Some(self.snapshot());
         let (w, h) = self.img_size();
         let id = self.alloc_id();
         self.texts.push(TextOverlay {
@@ -281,8 +730,22 @@ impl Editor {
         self.text_panel = true;
     }
 
+    pub(super) fn begin_text_editing(&mut self) {
+        if self.text_history_before.is_none() {
+            self.text_history_before = Some(self.snapshot());
+        }
+        self.text_editing = true;
+        self.text_need_focus = true;
+        self.text_panel = true;
+    }
+
     fn commit_or_drop_focused(&mut self) {
+        self.finish_text_style_history();
+        let before = self.text_history_before.take();
         let Some(i) = self.text_focus else {
+            if let Some(before) = before {
+                self.commit_history_before(before);
+            }
             return;
         };
         if self.texts.get(i).is_some_and(|t| t.text.trim().is_empty()) {
@@ -293,15 +756,30 @@ impl Editor {
         self.text_focus = None;
         self.text_need_focus = false;
         self.text_editing = false;
+        if let Some(before) = before {
+            self.commit_history_before(before);
+        }
     }
 
-    fn remove_text(&mut self, i: usize) {
+    fn remove_text_raw(&mut self, i: usize) {
         if i < self.texts.len() {
             self.texts.remove(i);
             self.text_focus = None;
             self.text_need_focus = false;
             self.text_editing = false;
             self.dirty = true;
+        }
+    }
+
+    pub(super) fn remove_text(&mut self, i: usize) {
+        if self.text_history_before.is_some() {
+            self.remove_text_raw(i);
+            let before = self.text_history_before.take();
+            if let Some(before) = before {
+                self.commit_history_before(before);
+            }
+        } else {
+            self.record_change(|ed| ed.remove_text_raw(i));
         }
     }
 
@@ -347,12 +825,7 @@ impl Editor {
             if b.show_original {
                 mirror::copy_rect(&mut out, &src, sel);
             } else {
-                let dir = match b.dir_pref {
-                    DirectionPref::Left => Direction::Left,
-                    DirectionPref::Right => Direction::Right,
-                    DirectionPref::Auto => mirror::auto_direction(&self.img, sel),
-                };
-                mirror::apply_mirror(&mut out, &src, sel, dir);
+                mirror::apply_mirror_with_axis(&mut out, &src, sel, b.axis, b.keep_side);
             }
         }
         out
@@ -373,11 +846,6 @@ impl Editor {
         self.boxes.iter().any(|b| b.animating())
     }
 
-    fn focused_mut(&mut self) -> &mut CropBox {
-        let i = self.focus.min(self.boxes.len().saturating_sub(1));
-        &mut self.boxes[i]
-    }
-
     fn clamp_focus(&mut self) {
         if self.boxes.is_empty() {
             return;
@@ -385,6 +853,8 @@ impl Editor {
         if self.focus >= self.boxes.len() {
             self.focus = self.boxes.len() - 1;
         }
+        self.selected_ids
+            .retain(|id| self.boxes.iter().any(|b| b.id == *id));
     }
 
     fn existing_rects(&self) -> Vec<Rect> {
@@ -392,7 +862,7 @@ impl Editor {
     }
 
     /// 程序性设置整图单框（带过渡）。
-    pub fn apply_full_box(&mut self) {
+    fn apply_full_box_raw(&mut self) {
         let (w, h) = self.img_size();
         let target = Rect::new(0, 0, w, h);
         let from = self
@@ -400,11 +870,16 @@ impl Editor {
             .get(self.focus)
             .map(|b| b.displayed())
             .unwrap_or(target);
-        let dir_pref = self
+        let axis = self
             .boxes
             .get(self.focus)
-            .map(|b| b.dir_pref)
-            .unwrap_or(self.default_dir);
+            .map(|b| b.axis)
+            .unwrap_or(self.default_axis);
+        let keep_side = self
+            .boxes
+            .get(self.focus)
+            .map(|b| b.keep_side)
+            .unwrap_or(self.default_keep_side);
         let show_original = self
             .boxes
             .get(self.focus)
@@ -415,8 +890,10 @@ impl Editor {
         self.boxes.push(CropBox {
             id,
             rect: target,
-            dir_pref,
+            axis,
+            keep_side: keep_side.normalized_for_axis(axis),
             show_original,
+            show_badge: true,
             anim: Some(BoxAnim {
                 from,
                 to: target,
@@ -424,13 +901,17 @@ impl Editor {
                 delay: 0.0,
             }),
         });
-        self.focus = 0;
+        self.select_only_raw(0);
         self.full_image = true;
         self.dirty = true;
     }
 
+    pub fn apply_full_box(&mut self) {
+        self.record_change(|ed| ed.apply_full_box_raw());
+    }
+
     /// 用给定人脸重建选框（退出整图模式）。`faces` 为空时在画面中央放一个比例框。
-    pub fn apply_face_boxes(&mut self, faces: &[Face]) {
+    fn apply_face_boxes_raw(&mut self, faces: &[Face]) {
         let (w, h) = self.img_size();
         let now = Instant::now();
         let targets: Vec<Rect> = if faces.is_empty() {
@@ -444,8 +925,12 @@ impl Editor {
             .map(|(i, &to)| CropBox {
                 id: self.next_id + i as u64,
                 rect: to,
-                dir_pref: self.default_dir,
+                axis: self.default_axis,
+                keep_side: self
+                    .default_keep_side
+                    .normalized_for_axis(self.default_axis),
                 show_original: false,
+                show_badge: true,
                 anim: Some(BoxAnim {
                     from: tiny_of(to, w, h),
                     to,
@@ -455,13 +940,18 @@ impl Editor {
             })
             .collect();
         self.next_id += targets.len() as u64;
+        self.selected_ids = self.boxes.first().map(|b| vec![b.id]).unwrap_or_default();
         self.focus = 0;
         self.full_image = false;
         self.dirty = true;
     }
 
+    pub fn apply_face_boxes(&mut self, faces: &[Face]) {
+        self.record_change(|ed| ed.apply_face_boxes_raw(faces));
+    }
+
     /// 加框：未覆盖人脸中 score 最高者；没有则放画面中央。
-    pub fn add_box(&mut self) {
+    fn add_box_raw(&mut self) {
         if self.full_image {
             return;
         }
@@ -477,8 +967,12 @@ impl Editor {
         self.boxes.push(CropBox {
             id,
             rect: target,
-            dir_pref: self.default_dir,
+            axis: self.default_axis,
+            keep_side: self
+                .default_keep_side
+                .normalized_for_axis(self.default_axis),
             show_original: false,
+            show_badge: true,
             anim: Some(BoxAnim {
                 from: tiny_of(target, w, h),
                 to: target,
@@ -486,34 +980,80 @@ impl Editor {
                 delay: 0.0,
             }),
         });
-        self.focus = self.boxes.len() - 1;
+        self.select_only_raw(self.boxes.len() - 1);
         self.dirty = true;
     }
 
-    pub fn remove_focused(&mut self) {
+    pub fn add_box(&mut self) {
+        self.record_change(|ed| ed.add_box_raw());
+    }
+
+    pub(super) fn can_remove_selection(&self) -> bool {
+        !self.full_image && self.boxes.len() > 1 && self.has_selection()
+    }
+
+    fn remove_selected_raw(&mut self) {
+        if !self.can_remove_selection() {
+            return;
+        }
+        let selected = self.selected_ids.clone();
+        // 只有全选时才保留焦点框，确保至少留一个；单选焦点框也必须能被删除。
+        let keep_id = (selected.len() == self.boxes.len())
+            .then(|| self.boxes.get(self.focus).map(|b| b.id))
+            .flatten();
+        self.boxes
+            .retain(|b| !selected.contains(&b.id) || Some(b.id) == keep_id);
+        self.clamp_focus();
+        if self.boxes.is_empty() {
+            return;
+        }
+        self.focus = self.focus.min(self.boxes.len() - 1);
+        self.select_only_raw(self.focus);
+        self.dirty = true;
+    }
+
+    pub(super) fn remove_selected(&mut self) {
+        self.record_change(|ed| ed.remove_selected_raw());
+    }
+
+    fn remove_focused_raw(&mut self) {
         if self.full_image || self.boxes.len() <= 1 {
             return;
         }
         self.boxes.remove(self.focus);
         self.clamp_focus();
+        if !self.boxes.is_empty() {
+            self.select_only_raw(self.focus);
+        }
         self.dirty = true;
+    }
+
+    pub fn remove_focused(&mut self) {
+        self.record_change(|ed| ed.remove_focused_raw());
     }
 
     fn commit_new_box(&mut self, sel: Rect) {
         let (w, h) = self.img_size();
         let sel = sel.normalized().clamped(w, h);
-        if !sel.is_mirrorable() || sel.width() < MIN_BOX || sel.height() < MIN_BOX {
+        if !sel.is_mirrorable_for(self.default_axis)
+            || sel.width() < MIN_BOX
+            || sel.height() < MIN_BOX
+        {
             return;
         }
         let id = self.alloc_id();
         self.boxes.push(CropBox {
             id,
             rect: sel,
-            dir_pref: self.default_dir,
+            axis: self.default_axis,
+            keep_side: self
+                .default_keep_side
+                .normalized_for_axis(self.default_axis),
             show_original: false,
+            show_badge: true,
             anim: None,
         });
-        self.focus = self.boxes.len() - 1;
+        self.select_only_raw(self.boxes.len() - 1);
         self.dirty = true;
     }
 
@@ -588,16 +1128,49 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
     ed.clamp_focus();
 
     ed.clamp_text_focus();
-    if !ui.ctx().egui_wants_keyboard_input() {
-        let del = ui.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
-                || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+    let wants_keyboard = ui.ctx().egui_wants_keyboard_input();
+    let mut history_command = false;
+    if !wants_keyboard {
+        let (undo, redo) = ui.input_mut(|i| {
+            // 先匹配更具体的 Ctrl+Shift+Z，否则 consume_key 的逻辑匹配会
+            // 把它当成普通 Ctrl+Z 消耗掉。
+            let redo = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y);
+            let undo = !redo && i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
+            (undo, redo)
         });
-        if del {
+        if undo {
+            ed.cancel_history_gesture();
+            ed.drag = DragMode::Idle;
+            ed.undo();
+            history_command = true;
+        } else if redo {
+            ed.cancel_history_gesture();
+            ed.drag = DragMode::Idle;
+            ed.redo();
+            history_command = true;
+        }
+    }
+    if !wants_keyboard && !history_command {
+        let (select_all, clear, delete) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::A),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace),
+            )
+        });
+        if select_all {
+            ed.select_all();
+        }
+        if clear {
+            ed.clear_selection();
+        }
+        if delete {
             if let Some(i) = ed.text_focus {
                 ed.remove_text(i);
-            } else if !ed.full_image && ed.boxes.len() > 1 {
-                ed.remove_focused();
+            } else {
+                ed.remove_selected();
             }
         }
     }
@@ -624,44 +1197,85 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
                 |ui| {
                     ui.set_height(bar_h);
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    if ui.button("← 主页").clicked() {
+
+                    if ui.button("←").on_hover_text("主页").clicked() {
                         request = EditorRequest::GoHome;
                     }
-                    if ui.button("打开新图…").clicked() {
+                    let undo = ui
+                        .add_enabled(
+                            ed.can_undo(),
+                            egui::Button::new(egui::RichText::new("↶").size(16.0)),
+                        )
+                        .on_hover_text("撤销 Ctrl+Z");
+                    if undo.clicked() {
+                        ed.undo();
+                    }
+                    let redo = ui
+                        .add_enabled(
+                            ed.can_redo(),
+                            egui::Button::new(egui::RichText::new("↷").size(16.0)),
+                        )
+                        .on_hover_text("重做 Ctrl+Y");
+                    if redo.clicked() {
+                        ed.redo();
+                    }
+                    if ui.button("打开").on_hover_text("打开新图").clicked() {
                         request = EditorRequest::OpenNew;
                     }
                     ui.separator();
 
-                    ui.label(egui::RichText::new("方向").color(p.text_secondary));
-                    let mut dir_changed = false;
-                    {
-                        let b = ed.focused_mut();
-                        if theme::segmented_control(
-                            ui,
-                            &mut b.dir_pref,
-                            &[
-                                (DirectionPref::Auto, "自动"),
-                                (DirectionPref::Left, "保留左半"),
-                                (DirectionPref::Right, "保留右半"),
-                            ],
-                        ) {
-                            dir_changed = true;
-                        }
+                    let box_count =
+                        egui::RichText::new(format!("{}/{}", ed.selected_count(), ed.boxes.len()))
+                            .color(p.text_secondary);
+
+                    ui.label(egui::RichText::new("镜像").color(p.text_secondary));
+                    let axis = ed.selected_axis();
+                    if let Some(picked) = theme::segmented_control_optional(
+                        ui,
+                        axis,
+                        &[
+                            (MirrorAxis::Horizontal, "水平"),
+                            (MirrorAxis::Vertical, "垂直"),
+                        ],
+                        ed.has_selection(),
+                    ) {
+                        ed.apply_axis_to_selection(picked);
                     }
-                    if dir_changed {
-                        ed.dirty = true;
+
+                    let axis = ed.selected_axis();
+                    let axis_for_labels = axis.unwrap_or(ed.default_axis);
+                    let side_options = match axis_for_labels {
+                        MirrorAxis::Horizontal => [
+                            (KeepSide::Auto, "自动"),
+                            (KeepSide::Left, "左"),
+                            (KeepSide::Right, "右"),
+                        ],
+                        MirrorAxis::Vertical => [
+                            (KeepSide::Auto, "自动"),
+                            (KeepSide::Top, "上"),
+                            (KeepSide::Bottom, "下"),
+                        ],
+                    };
+                    ui.label(egui::RichText::new("保留").color(p.text_secondary));
+                    if let Some(picked) = theme::segmented_control_optional(
+                        ui,
+                        axis.and_then(|_| ed.selected_keep_side()),
+                        &side_options,
+                        axis.is_some() && ed.has_selection(),
+                    ) {
+                        ed.apply_keep_side_to_selection(picked);
                     }
                     ui.separator();
 
-                    if ui.button("人脸框选").clicked() {
+                    if ui.button("人脸").on_hover_text("人脸框选").clicked() {
                         request = EditorRequest::RedetectFace;
                     }
-                    if ui.button("整图框选").clicked() {
+                    if ui.button("整图").on_hover_text("整图框选").clicked() {
                         ed.apply_full_box();
                     }
 
                     let full = ed.full_image;
-                    let add = ui.add_enabled(!full, egui::Button::new("+ 加框"));
+                    let add = ui.add_enabled(!full, egui::Button::new("+"));
                     let add = if full {
                         add.on_disabled_hover_text("整图框选时不能添加选框")
                     } else {
@@ -671,31 +1285,44 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
                         request = EditorRequest::AddBox;
                     }
 
-                    let can_del = !ed.full_image && ed.boxes.len() > 1;
-                    if can_del {
-                        let n = ed.boxes.len();
-                        let idx = ed.focus + 1;
-                        ui.label(
-                            egui::RichText::new(format!("{idx} / {n}")).color(p.text_secondary),
-                        );
-                        if ui.button("删框").clicked() {
-                            ed.remove_focused();
-                        }
+                    ui.label(box_count);
+                    let del = ui
+                        .add_enabled(!full && ed.can_remove_selection(), egui::Button::new("−"))
+                        .on_hover_text("删除选中框");
+                    if del.clicked() {
+                        ed.remove_selected();
                     }
                     ui.separator();
 
-                    let mut orig_changed = false;
+                    let mut original_state = if ed.has_selection() {
+                        ed.selected_show_original()
+                    } else {
+                        Some(false)
+                    };
+                    let original_resp = theme::tristate_checkbox(
+                        ui,
+                        &mut original_state,
+                        "原图",
+                        ed.has_selection(),
+                    );
+                    if original_resp.changed()
+                        && let Some(value) = original_state
                     {
-                        let b = ed.focused_mut();
-                        if theme::accent_checkbox(ui, &mut b.show_original, "查看原图").changed()
-                        {
-                            orig_changed = true;
-                        }
+                        ed.apply_show_original_to_selection(value);
                     }
-                    if orig_changed {
-                        ed.dirty = true;
+                    let mut badge_state = if ed.has_selection() {
+                        ed.selected_show_badge()
+                    } else {
+                        Some(false)
+                    };
+                    let badge_resp =
+                        theme::tristate_checkbox(ui, &mut badge_state, "角标", ed.has_selection())
+                            .on_hover_text("每个选框单独显示角上编号；混合状态点击后全部开启");
+                    if badge_resp.changed()
+                        && let Some(value) = badge_state
+                    {
+                        ed.apply_show_badge_to_selection(value);
                     }
-                    let _ = theme::accent_checkbox(ui, &mut ed.show_badges, "显示角标");
                     ui.separator();
                     if theme::toggle_button(ui, ed.text_panel, "文字")
                         .on_hover_text("文字模式：点击图片添加文字")
@@ -715,15 +1342,30 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::accent_button(ui, "保存图片").clicked() {
+                        if theme::accent_button(ui, "保存")
+                            .on_hover_text("保存图片")
+                            .clicked()
+                        {
                             request = ed.save_as();
                         }
-                        if ui.button("复制图片").clicked() {
+                        if ui.button("复制").on_hover_text("复制图片").clicked() {
                             request = ed.copy_to_clipboard();
                         }
-                        if ed.boxes.len() == 1 {
-                            let _ = theme::accent_checkbox(ui, &mut ed.crop_export, "仅框选处")
-                                .on_hover_text("复制和保存只保留选框内的画面");
+                        let crop_enabled = ed.boxes.len() == 1;
+                        let mut crop_export = ed.crop_export;
+                        let crop_resp = theme::accent_checkbox_enabled(
+                            ui,
+                            &mut crop_export,
+                            "仅选框",
+                            crop_enabled,
+                        );
+                        let crop_resp = if crop_enabled {
+                            crop_resp.on_hover_text("复制和保存只保留选框内的画面")
+                        } else {
+                            crop_resp.on_disabled_hover_text("多个选框时输出整图，设置会保留")
+                        };
+                        if crop_enabled && crop_resp.changed() {
+                            ed.set_crop_export(crop_export);
                         }
                     });
                 },
@@ -756,7 +1398,7 @@ pub fn show(ui: &mut egui::Ui, ed: &mut Editor, enter: theme::PageEnter) -> Edit
 
     egui::CentralPanel::default().show(ui, |ui| {
         enter.apply(ui);
-        canvas::show(ui, ed);
+        canvas::show(ui, ed, history_command);
     });
 
     request
@@ -789,7 +1431,7 @@ mod tests {
     #[test]
     fn face_select_without_faces_uses_center_not_full() {
         let img = RgbaImage::new(200, 100);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         assert!(ed.is_full_image());
         ed.apply_face_boxes(&[]);
         assert!(!ed.is_full_image());
@@ -800,7 +1442,7 @@ mod tests {
     #[test]
     fn face_boxes_roundtrip_reuses_cache() {
         let img = RgbaImage::new(200, 200);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         let f_hi = face([20.0, 20.0, 60.0, 60.0], 0.99);
         let f_lo = face([120.0, 20.0, 160.0, 60.0], 0.7);
         ed.apply_face_boxes(&[f_hi, f_lo]);
@@ -819,7 +1461,7 @@ mod tests {
     #[test]
     fn cached_face_boxes_single_picks_largest() {
         let img = RgbaImage::new(200, 200);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         let f_hi = face([20.0, 20.0, 80.0, 80.0], 0.9);
         let f_lo = face([120.0, 20.0, 150.0, 50.0], 0.8);
         ed.set_faces(vec![f_hi, f_lo]);
@@ -831,7 +1473,7 @@ mod tests {
     #[test]
     fn apply_cached_face_boxes_noop_without_cache() {
         let img = RgbaImage::new(80, 80);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         assert!(!ed.faces_cached());
         assert!(!ed.apply_cached_face_boxes(true));
         assert!(ed.is_full_image());
@@ -840,7 +1482,7 @@ mod tests {
     #[test]
     fn full_image_rejects_add_box() {
         let img = RgbaImage::new(80, 80);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         assert!(ed.is_full_image());
         assert_eq!(ed.boxes.len(), 1);
         ed.add_box();
@@ -850,7 +1492,7 @@ mod tests {
     #[test]
     fn add_box_picks_highest_unused_then_center() {
         let img = RgbaImage::new(200, 200);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         let f_hi = face([20.0, 20.0, 60.0, 60.0], 0.99);
         let f_lo = face([120.0, 20.0, 160.0, 60.0], 0.7);
         ed.apply_face_boxes(&[f_hi]);
@@ -866,30 +1508,205 @@ mod tests {
     }
 
     #[test]
-    fn per_box_direction_and_original_are_independent() {
+    fn per_box_axis_and_original_are_independent() {
         let img = RgbaImage::new(120, 120);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         ed.apply_face_boxes(&[
             face([10.0, 10.0, 50.0, 50.0], 0.9),
             face([70.0, 10.0, 110.0, 50.0], 0.8),
         ]);
         assert_eq!(ed.boxes.len(), 2);
-        ed.boxes[0].dir_pref = DirectionPref::Left;
+        ed.boxes[0].axis = MirrorAxis::Horizontal;
+        ed.boxes[0].keep_side = KeepSide::Left;
         ed.boxes[0].show_original = true;
-        ed.boxes[1].dir_pref = DirectionPref::Right;
+        ed.boxes[1].axis = MirrorAxis::Horizontal;
+        ed.boxes[1].keep_side = KeepSide::Right;
         ed.boxes[1].show_original = false;
         ed.focus = 0;
-        assert_eq!(ed.boxes[ed.focus].dir_pref, DirectionPref::Left);
+        assert_eq!(ed.boxes[ed.focus].keep_side, KeepSide::Left);
         assert!(ed.boxes[ed.focus].show_original);
         ed.focus = 1;
-        assert_eq!(ed.boxes[ed.focus].dir_pref, DirectionPref::Right);
+        assert_eq!(ed.boxes[ed.focus].keep_side, KeepSide::Right);
         assert!(!ed.boxes[ed.focus].show_original);
+    }
+
+    #[test]
+    fn multi_selection_requires_explicit_bulk_value() {
+        let img = RgbaImage::new(160, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([90.0, 10.0, 130.0, 50.0], 0.8),
+        ]);
+        assert_eq!(ed.selected_count(), 1);
+        ed.toggle_selection(1);
+        assert_eq!(ed.selected_count(), 2);
+        ed.boxes[0].keep_side = KeepSide::Left;
+        ed.boxes[1].keep_side = KeepSide::Right;
+        assert_eq!(ed.selected_keep_side(), None);
+        ed.apply_keep_side_to_selection(KeepSide::Right);
+        assert_eq!(ed.boxes[0].keep_side, KeepSide::Right);
+        assert_eq!(ed.boxes[1].keep_side, KeepSide::Right);
+
+        ed.boxes[0].show_badge = true;
+        ed.boxes[1].show_badge = false;
+        assert_eq!(ed.selected_show_badge(), None);
+        ed.apply_show_badge_to_selection(true);
+        assert_eq!(
+            ed.boxes.iter().map(|b| b.show_badge).collect::<Vec<_>>(),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn select_all_and_delete_keep_one_box() {
+        let img = RgbaImage::new(160, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([90.0, 10.0, 130.0, 50.0], 0.8),
+        ]);
+        ed.select_all();
+        assert_eq!(ed.selected_count(), 2);
+        ed.remove_selected();
+        assert_eq!(ed.boxes.len(), 1);
+        assert_eq!(ed.selected_count(), 1);
+    }
+
+    #[test]
+    fn switching_axis_preserves_relative_keep_side() {
+        let img = RgbaImage::new(100, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, true);
+        ed.apply_axis_to_selection(MirrorAxis::Vertical);
+        assert_eq!(ed.boxes[0].axis, MirrorAxis::Vertical);
+        assert_eq!(ed.boxes[0].keep_side, KeepSide::Top);
+    }
+
+    #[test]
+    fn selection_history_restores_focus_and_redoes() {
+        let img = RgbaImage::new(160, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([90.0, 10.0, 130.0, 50.0], 0.8),
+        ]);
+        ed.reset_history();
+        ed.dirty = false;
+        ed.select_only(1);
+        assert_eq!(ed.focus, 1);
+        assert_eq!(ed.selected_ids, vec![ed.boxes[1].id]);
+        assert!(ed.can_undo());
+        ed.undo();
+        assert_eq!(ed.focus, 0);
+        assert_eq!(ed.selected_ids, vec![ed.boxes[0].id]);
+        assert!(
+            !ed.dirty,
+            "selection-only undo should not invalidate the result"
+        );
+        ed.redo();
+        assert_eq!(ed.focus, 1);
+        assert_eq!(ed.selected_ids, vec![ed.boxes[1].id]);
+    }
+
+    #[test]
+    fn add_box_undo_restores_previous_selection_and_redo_readds_box() {
+        let img = RgbaImage::new(160, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([90.0, 10.0, 130.0, 50.0], 0.8),
+        ]);
+        ed.reset_history();
+        let previous_ids: Vec<_> = ed.boxes.iter().map(|b| b.id).collect();
+        ed.add_box();
+        assert_eq!(ed.boxes.len(), 3);
+        let added_id = ed.boxes[2].id;
+        assert_eq!(ed.selected_ids, vec![added_id]);
+        ed.undo();
+        assert_eq!(
+            ed.boxes.iter().map(|b| b.id).collect::<Vec<_>>(),
+            previous_ids
+        );
+        assert_eq!(ed.selected_ids, vec![ed.boxes[0].id]);
+        ed.redo();
+        assert_eq!(ed.boxes.len(), 3);
+        assert_eq!(ed.selected_ids, vec![added_id]);
+    }
+
+    #[test]
+    fn new_selection_change_clears_redo_stack() {
+        let img = RgbaImage::new(160, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([90.0, 10.0, 130.0, 50.0], 0.8),
+        ]);
+        ed.reset_history();
+        ed.select_only(1);
+        ed.undo();
+        assert!(ed.can_redo());
+        ed.select_only(1);
+        assert!(!ed.can_redo());
+    }
+
+    #[test]
+    fn text_style_history_keeps_followup_edit_baseline() {
+        let img = RgbaImage::new(100, 80);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.text_draft = "x".into();
+        ed.begin_text_at(50.0, 40.0);
+        ed.texts[0].text = "a".into();
+        ed.begin_text_style_history(ed.snapshot());
+        ed.texts[0].size = 48.0;
+        ed.finish_text_style_history();
+        ed.texts[0].text.push('b');
+        ed.commit_or_drop_focused();
+
+        ed.undo();
+        assert_eq!(ed.texts[0].text, "a");
+        assert_eq!(ed.texts[0].size, 48.0);
+        ed.undo();
+        assert!(ed.texts.is_empty());
+    }
+
+    #[test]
+    fn focused_box_delete_is_undoable() {
+        let img = RgbaImage::new(160, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([90.0, 10.0, 130.0, 50.0], 0.8),
+        ]);
+        ed.reset_history();
+        ed.select_only(1);
+        ed.remove_focused();
+        assert_eq!(ed.boxes.len(), 1);
+        ed.undo();
+        assert_eq!(ed.boxes.len(), 2);
+        assert_eq!(ed.focus, 1);
+        assert_eq!(ed.selected_count(), 1);
+    }
+
+    #[test]
+    fn selected_box_delete_removes_focus_box() {
+        let img = RgbaImage::new(160, 100);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
+        ed.apply_face_boxes(&[
+            face([10.0, 10.0, 50.0, 50.0], 0.9),
+            face([90.0, 10.0, 130.0, 50.0], 0.8),
+        ]);
+        ed.reset_history();
+        ed.select_only(1);
+        ed.remove_selected();
+        assert_eq!(ed.boxes.len(), 1);
+        assert_eq!(ed.selected_count(), 1);
+        assert_eq!(ed.focus, 0);
     }
 
     #[test]
     fn place_text_at_center_and_delete() {
         let img = RgbaImage::new(80, 40);
-        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, true);
         ed.text_draft = "强".into();
         ed.place_text(20.0, 10.0);
         assert_eq!(ed.texts.len(), 1);
@@ -903,7 +1720,7 @@ mod tests {
     #[test]
     fn begin_text_empty_drops_on_commit() {
         let img = RgbaImage::new(80, 40);
-        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, true);
         ed.begin_text_at(20.0, 10.0);
         assert_eq!(ed.texts.len(), 1);
         assert!(ed.texts[0].text.is_empty());
@@ -916,7 +1733,7 @@ mod tests {
     #[test]
     fn select_text_keeps_it_and_allows_move() {
         let img = RgbaImage::new(80, 40);
-        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, true);
         ed.text_draft = "强".into();
         ed.place_text(20.0, 10.0);
         ed.commit_or_drop_focused();
@@ -939,8 +1756,9 @@ mod tests {
             return;
         };
         let img = RgbaImage::from_pixel(80, 80, image::Rgba([0, 0, 0, 255]));
-        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
-        ed.boxes[0].dir_pref = DirectionPref::Left;
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, true);
+        ed.boxes[0].axis = MirrorAxis::Horizontal;
+        ed.boxes[0].keep_side = KeepSide::Left;
         ed.boxes[0].show_original = true;
         ed.text_draft = "Q".into();
         ed.text_draft_size = 36.0;
@@ -965,8 +1783,9 @@ mod tests {
             return;
         };
         let img = RgbaImage::from_pixel(100, 50, image::Rgba([0, 0, 0, 255]));
-        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
-        ed.boxes[0].dir_pref = DirectionPref::Left;
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, true);
+        ed.boxes[0].axis = MirrorAxis::Horizontal;
+        ed.boxes[0].keep_side = KeepSide::Left;
         ed.text_draft = "Q".into();
         ed.text_draft_size = 28.0;
         ed.place_text(25.0, 25.0);
@@ -991,7 +1810,7 @@ mod tests {
     #[test]
     fn export_crops_single_box_when_enabled() {
         let img = RgbaImage::from_fn(100, 80, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
-        let mut ed = Editor::new(img, None, DirectionPref::Left, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, true);
         ed.apply_face_boxes(&[]);
         assert_eq!(ed.boxes.len(), 1);
         assert!(ed.crop_export);
@@ -1009,7 +1828,7 @@ mod tests {
     #[test]
     fn export_keeps_full_when_crop_disabled() {
         let img = RgbaImage::new(100, 80);
-        let mut ed = Editor::new(img, None, DirectionPref::Left, false);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Left, false);
         ed.apply_face_boxes(&[]);
         let out = ed.export_image();
         assert_eq!(out.dimensions(), (100, 80));
@@ -1018,7 +1837,7 @@ mod tests {
     #[test]
     fn export_keeps_full_with_multiple_boxes() {
         let img = RgbaImage::new(200, 200);
-        let mut ed = Editor::new(img, None, DirectionPref::Auto, true);
+        let mut ed = Editor::new(img, None, MirrorAxis::Horizontal, KeepSide::Auto, true);
         ed.apply_face_boxes(&[
             face([10.0, 10.0, 50.0, 50.0], 0.9),
             face([70.0, 10.0, 110.0, 50.0], 0.8),

@@ -3,7 +3,7 @@
 use eframe::egui;
 
 use crate::core::crop::MIN_BOX;
-use crate::core::mirror::Rect;
+use crate::core::mirror::{MirrorAxis, Rect};
 use crate::core::text as overlay_text;
 use crate::ui::theme;
 
@@ -47,13 +47,12 @@ impl Handle {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub(super) enum DragMode {
     Idle,
     Move {
-        index: usize,
-        grab_dx: f32,
-        grab_dy: f32,
+        origins: Vec<(u64, Rect)>,
+        start: (f32, f32),
     },
     Resize {
         index: usize,
@@ -267,7 +266,7 @@ fn show_inline_editor(ui: &mut egui::Ui, ed: &mut Editor, view: &View) {
     }
 }
 
-pub(super) fn show(ui: &mut egui::Ui, ed: &mut Editor) {
+pub(super) fn show(ui: &mut egui::Ui, ed: &mut Editor, history_command: bool) {
     ed.refresh_result(ui.ctx());
     if ed.any_animating() {
         ui.ctx().request_repaint();
@@ -303,9 +302,13 @@ pub(super) fn show(ui: &mut egui::Ui, ed: &mut Editor) {
         });
     let response = response.on_hover_cursor(canvas_cursor);
 
-    handle_drag(ed, &view, &response, &displayed);
+    let ctrl = ui.input(|i| i.modifiers.ctrl);
+    if !history_command {
+        handle_drag(ed, &view, &response, &displayed, ctrl);
+    }
 
-    if response.clicked()
+    if !history_command
+        && response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
     {
         let on_editor = ed.text_editing
@@ -317,9 +320,7 @@ pub(super) fn show(ui: &mut egui::Ui, ed: &mut Editor) {
             let p = view.to_image(pos);
             if let Some(i) = hit_texts(ed, p) {
                 if ed.text_focus == Some(i) {
-                    ed.text_editing = true;
-                    ed.text_need_focus = true;
-                    ed.text_panel = true;
+                    ed.begin_text_editing();
                 } else {
                     ed.commit_or_drop_focused();
                     ed.select_text(i);
@@ -329,13 +330,19 @@ pub(super) fn show(ui: &mut egui::Ui, ed: &mut Editor) {
             } else {
                 ed.commit_or_drop_focused();
                 if let Some(i) = hit_boxes(p, &displayed, focus) {
-                    ed.focus = i;
+                    if ui.input(|input| input.modifiers.ctrl) {
+                        ed.toggle_selection(i);
+                    } else {
+                        ed.select_only(i);
+                    }
+                } else {
+                    ed.clear_selection();
                 }
             }
         }
     }
 
-    let hovered_handle = if ed.drag == DragMode::Idle {
+    let hovered_handle = if ed.drag == DragMode::Idle && ed.is_selected_index(ed.focus) {
         ui.ctx()
             .pointer_hover_pos()
             .filter(|pos| view.rect.contains(*pos))
@@ -348,15 +355,28 @@ pub(super) fn show(ui: &mut egui::Ui, ed: &mut Editor) {
         None
     };
 
-    let preview = match ed.drag {
-        DragMode::NewBox { current, .. } => Some(current),
+    let preview = match &ed.drag {
+        DragMode::NewBox { current, .. } => Some(*current),
         _ => None,
     };
     paint(ui, ed, &view, &displayed, hovered_handle, preview);
     show_inline_editor(ui, ed, &view);
+
+    // click-and-drag 在同一帧既可能报告 clicked 也可能报告 drag_stopped；
+    // 把点击后的单选/焦点变化纳入同一个手势，避免一次点击产生两条历史。
+    // 放在内联文字编辑器之后，保证同一帧的文字变化也属于这一步。
+    if !history_command && (response.drag_stopped() || response.clicked()) {
+        ed.finish_history_gesture();
+    }
 }
 
-fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displayed: &[Rect]) {
+fn handle_drag(
+    ed: &mut Editor,
+    view: &View,
+    response: &egui::Response,
+    displayed: &[Rect],
+    ctrl: bool,
+) {
     let (img_w, img_h) = ed.img_size();
     let focus = ed.focus.min(displayed.len().saturating_sub(1));
 
@@ -365,50 +385,72 @@ fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displaye
     {
         let p = view.to_image(pos);
         let tol = 10.0 / view.scale;
-        if let Some(sel) = displayed.get(focus).copied() {
-            if let Some(i) = hit_texts(ed, p) {
-                if ed.text_focus != Some(i) {
-                    ed.commit_or_drop_focused();
-                    ed.select_text(i);
-                }
-                let t = &ed.texts[i];
-                ed.drag = DragMode::MoveText {
-                    index: i,
-                    grab_dx: p.0 - t.x,
-                    grab_dy: p.1 - t.y,
-                };
-            } else if let Some(h) = hit_handle(p, sel, tol) {
-                let b = &mut ed.boxes[focus];
-                b.anim = None;
-                b.rect = sel;
-                ed.drag = DragMode::Resize {
-                    index: focus,
-                    handle: h,
-                };
-            } else if ed.placing_text() {
-                ed.drag = DragMode::Idle;
-            } else if let Some(i) = hit_boxes(p, displayed, focus) {
-                ed.focus = i;
-                let sel_i = displayed[i];
-                let b = &mut ed.boxes[i];
-                b.anim = None;
-                b.rect = sel_i;
-                ed.drag = DragMode::Move {
-                    index: i,
-                    grab_dx: p.0 - sel_i.x0 as f32,
-                    grab_dy: p.1 - sel_i.y0 as f32,
-                };
-            } else if !ed.full_image {
-                let current = Rect::new(
-                    p.0.round() as i32,
-                    p.1.round() as i32,
-                    p.0.round() as i32,
-                    p.1.round() as i32,
-                );
-                ed.drag = DragMode::NewBox { start: p, current };
-            } else {
-                ed.drag = DragMode::Idle;
+        if let Some(i) = hit_texts(ed, p) {
+            if ed.text_focus != Some(i) {
+                ed.commit_or_drop_focused();
             }
+            ed.begin_history_gesture();
+            if ed.text_focus != Some(i) {
+                ed.select_text(i);
+            }
+            let t = &ed.texts[i];
+            ed.drag = DragMode::MoveText {
+                index: i,
+                grab_dx: p.0 - t.x,
+                grab_dy: p.1 - t.y,
+            };
+        } else if ed.placing_text() {
+            ed.drag = DragMode::Idle;
+        } else if let Some(i) = hit_boxes(p, displayed, focus) {
+            if ctrl {
+                ed.drag = DragMode::Idle;
+            } else {
+                ed.commit_or_drop_focused();
+                ed.begin_history_gesture();
+                if !ed.is_selected_index(i) {
+                    ed.select_only_raw(i);
+                } else {
+                    ed.focus = i;
+                }
+                let sel_i = displayed[i];
+                if let Some(h) = hit_handle(p, sel_i, tol) {
+                    let b = &mut ed.boxes[i];
+                    b.anim = None;
+                    b.rect = sel_i;
+                    ed.drag = DragMode::Resize {
+                        index: i,
+                        handle: h,
+                    };
+                } else {
+                    let ids = ed.selected_ids.clone();
+                    let origins = ed
+                        .boxes
+                        .iter_mut()
+                        .zip(displayed.iter().copied())
+                        .filter_map(|(b, displayed)| {
+                            if ids.contains(&b.id) {
+                                b.anim = None;
+                                b.rect = displayed;
+                                Some((b.id, displayed.normalized()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    ed.drag = DragMode::Move { origins, start: p };
+                }
+            }
+        } else if !ed.full_image && !ctrl {
+            ed.begin_history_gesture();
+            let current = Rect::new(
+                p.0.round() as i32,
+                p.1.round() as i32,
+                p.0.round() as i32,
+                p.1.round() as i32,
+            );
+            ed.drag = DragMode::NewBox { start: p, current };
+        } else {
+            ed.drag = DragMode::Idle;
         }
     }
 
@@ -416,29 +458,42 @@ fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displaye
         && let Some(pos) = response.interact_pointer_pos()
     {
         let p = view.to_image(pos);
-        match ed.drag {
-            DragMode::Move {
-                index,
-                grab_dx,
-                grab_dy,
-            } => {
-                if let Some(b) = ed.boxes.get_mut(index) {
-                    let mut sel = b.rect.normalized();
-                    let (w, h) = (sel.width(), sel.height());
-                    let nx0 = (p.0 - grab_dx).round().clamp(0.0, (img_w - w) as f32) as i32;
-                    let ny0 = (p.1 - grab_dy).round().clamp(0.0, (img_h - h) as f32) as i32;
-                    sel = Rect::new(nx0, ny0, nx0 + w, ny0 + h);
-                    if sel != b.rect {
-                        b.rect = sel;
-                        ed.dirty = true;
+        match &mut ed.drag {
+            DragMode::Move { origins, start } => {
+                let raw_dx = (p.0 - start.0).round() as i32;
+                let raw_dy = (p.1 - start.1).round() as i32;
+                let mut min_dx = i32::MIN / 4;
+                let mut max_dx = i32::MAX / 4;
+                let mut min_dy = i32::MIN / 4;
+                let mut max_dy = i32::MAX / 4;
+                for (_, r) in origins.iter() {
+                    min_dx = min_dx.max(-r.x0);
+                    max_dx = max_dx.min(img_w - r.x1);
+                    min_dy = min_dy.max(-r.y0);
+                    max_dy = max_dy.min(img_h - r.y1);
+                }
+                let dx = raw_dx.clamp(min_dx, max_dx);
+                let dy = raw_dy.clamp(min_dy, max_dy);
+                for (id, origin) in origins.iter() {
+                    if let Some(b) = ed.boxes.iter_mut().find(|b| b.id == *id) {
+                        let sel = Rect::new(
+                            origin.x0 + dx,
+                            origin.y0 + dy,
+                            origin.x1 + dx,
+                            origin.y1 + dy,
+                        );
+                        if sel != b.rect {
+                            b.rect = sel;
+                            ed.dirty = true;
+                        }
                     }
                 }
             }
             DragMode::Resize { index, handle } => {
-                if let Some(b) = ed.boxes.get_mut(index) {
+                if let Some(b) = ed.boxes.get_mut(*index) {
                     let mut sel = b.rect.normalized();
                     let (px, py) = (p.0.round() as i32, p.1.round() as i32);
-                    match handle {
+                    match *handle {
                         Handle::L => sel.x0 = px.min(sel.x1 - MIN_BOX),
                         Handle::R => sel.x1 = px.max(sel.x0 + MIN_BOX),
                         Handle::T => sel.y0 = py.min(sel.y1 - MIN_BOX),
@@ -476,16 +531,19 @@ fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displaye
                 )
                 .normalized()
                 .clamped(img_w, img_h);
-                ed.drag = DragMode::NewBox { start, current };
+                ed.drag = DragMode::NewBox {
+                    start: *start,
+                    current,
+                };
             }
             DragMode::MoveText {
                 index,
                 grab_dx,
                 grab_dy,
             } => {
-                if let Some(t) = ed.texts.get_mut(index) {
-                    let nx = (p.0 - grab_dx).clamp(0.0, img_w as f32);
-                    let ny = (p.1 - grab_dy).clamp(0.0, img_h as f32);
+                if let Some(t) = ed.texts.get_mut(*index) {
+                    let nx = (p.0 - *grab_dx).clamp(0.0, img_w as f32);
+                    let ny = (p.1 - *grab_dy).clamp(0.0, img_h as f32);
                     if t.x != nx || t.y != ny {
                         t.x = nx;
                         t.y = ny;
@@ -498,8 +556,8 @@ fn handle_drag(ed: &mut Editor, view: &View, response: &egui::Response, displaye
     }
 
     if response.drag_stopped() {
-        if let DragMode::NewBox { current, .. } = ed.drag {
-            ed.commit_new_box(current);
+        if let DragMode::NewBox { current, .. } = &ed.drag {
+            ed.commit_new_box(*current);
         }
         ed.drag = DragMode::Idle;
     }
@@ -525,12 +583,6 @@ fn paint(
 
     painter.rect_filled(view.rect, 0.0, theme::canvas::DIM);
 
-    let badge_t = theme::anim::ease_out(ui.ctx().animate_bool_with_time(
-        ui.id().with("badges_vis"),
-        ed.show_badges && displayed.len() > 1,
-        theme::anim::FAST.as_secs_f32(),
-    ));
-
     let punch = |painter: &egui::Painter, sel: Rect, tex: &egui::TextureHandle| {
         let s = sel.normalized();
         if s.width() < 1 || s.height() < 1 {
@@ -546,12 +598,13 @@ fn paint(
 
     if let Some(tex) = ed.result_tex.as_ref() {
         for (i, (b, sel)) in ed.boxes.iter().zip(displayed.iter()).enumerate() {
-            if i == ed.focus || !b.appeared() {
+            if (i == ed.focus && ed.is_selected_index(i)) || !b.appeared() {
                 continue;
             }
             punch(&painter, *sel, tex);
         }
-        if let Some((b, sel)) = ed.boxes.get(ed.focus).zip(displayed.get(ed.focus))
+        if ed.is_selected_index(ed.focus)
+            && let Some((b, sel)) = ed.boxes.get(ed.focus).zip(displayed.get(ed.focus))
             && b.appeared()
         {
             punch(&painter, *sel, tex);
@@ -560,7 +613,7 @@ fn paint(
 
     // 未聚焦框：次级描边 + 淡轴。聚焦框最后画。
     for (i, (b, sel)) in ed.boxes.iter().zip(displayed.iter()).enumerate() {
-        if i == ed.focus || !b.appeared() {
+        if (i == ed.focus && ed.is_selected_index(i)) || !b.appeared() {
             continue;
         }
         let sr = view.sel_screen_rect(sel.normalized());
@@ -569,24 +622,46 @@ fn paint(
             .pointer_hover_pos()
             .is_some_and(|pos| sr.contains(pos));
         let t = theme::hover_t(ui, ui.id().with(("box_h", b.id)), over);
-        let stroke = theme::lerp_color(
-            theme::lerp_color(p.stroke_control, p.accent, 0.55),
-            p.accent,
-            t,
-        );
+        let selected = ed.is_selected_index(i);
+        let base = if selected {
+            theme::lerp_color(p.accent_tint, p.accent, 0.55)
+        } else {
+            theme::lerp_color(p.stroke_control, p.accent, 0.55)
+        };
+        let stroke = theme::lerp_color(base, p.accent, t);
         painter.rect_stroke(
             sr,
             0.0,
             egui::Stroke::new(1.5 + 0.5 * t, stroke),
             egui::StrokeKind::Inside,
         );
-        paint_axis(&painter, sr, 0.45);
+        paint_axis(&painter, sr, b.axis, if selected { 0.65 } else { 0.45 });
+        let badge_t = theme::anim::ease_out(ui.ctx().animate_bool_with_time(
+            ui.id().with(("badge_vis", b.id)),
+            b.show_badge && displayed.len() > 1,
+            theme::anim::FAST.as_secs_f32(),
+        ));
         if badge_t > 0.01 {
-            paint_badge(ui, &painter, sr, b.id, i, false, p, badge_t);
+            paint_badge(ui, &painter, sr, b.id, i, selected, p, badge_t);
+        }
+        let marker_t = theme::anim::ease_out(ui.ctx().animate_bool_with_time(
+            ui.id().with(("selection_marker", b.id)),
+            selected,
+            theme::anim::FAST.as_secs_f32(),
+        ));
+        if marker_t > 0.01 {
+            paint_selection_marker(
+                &painter,
+                sr,
+                b.show_badge && displayed.len() > 1,
+                p,
+                marker_t,
+            );
         }
     }
 
-    if let Some((b, sel)) = ed.boxes.get(ed.focus).zip(displayed.get(ed.focus))
+    if ed.is_selected_index(ed.focus)
+        && let Some((b, sel)) = ed.boxes.get(ed.focus).zip(displayed.get(ed.focus))
         && b.appeared()
     {
         let s = sel.normalized();
@@ -604,7 +679,12 @@ fn paint(
             egui::Stroke::new(2.0 + 1.0 * border_t, border_color),
             egui::StrokeKind::Inside,
         );
-        paint_axis(&painter, sr, 0.55 + 0.45 * focus_t);
+        paint_axis(&painter, sr, b.axis, 0.55 + 0.45 * focus_t);
+        let badge_t = theme::anim::ease_out(ui.ctx().animate_bool_with_time(
+            ui.id().with(("badge_vis", b.id)),
+            b.show_badge && displayed.len() > 1,
+            theme::anim::FAST.as_secs_f32(),
+        ));
         if badge_t > 0.01 {
             paint_badge(ui, &painter, sr, b.id, ed.focus, true, p, badge_t);
         }
@@ -644,7 +724,7 @@ fn paint(
             0.0,
             theme::with_alpha(p.accent, theme::canvas::PREVIEW_ALPHA),
         );
-        paint_axis(&painter, sr, 0.7);
+        paint_axis(&painter, sr, ed.default_axis, 0.7);
     }
 
     if let Some(font) = overlay_text::system_font() {
@@ -685,19 +765,36 @@ fn paint(
     }
 }
 
-fn paint_axis(painter: &egui::Painter, sr: egui::Rect, alpha: f32) {
-    let axis_x = (sr.min.x + sr.max.x) / 2.0;
+fn paint_axis(painter: &egui::Painter, sr: egui::Rect, axis: MirrorAxis, alpha: f32) {
     let dash = 6.0;
-    let mut y = sr.min.y;
     let (white, shadow) = theme::canvas::axis_strokes(alpha);
-    while y < sr.max.y {
-        let y2 = (y + dash).min(sr.max.y);
-        painter.line_segment(
-            [egui::pos2(axis_x + 0.8, y), egui::pos2(axis_x + 0.8, y2)],
-            shadow,
-        );
-        painter.line_segment([egui::pos2(axis_x, y), egui::pos2(axis_x, y2)], white);
-        y += dash * 2.0;
+    match axis {
+        MirrorAxis::Horizontal => {
+            let axis_x = (sr.min.x + sr.max.x) / 2.0;
+            let mut y = sr.min.y;
+            while y < sr.max.y {
+                let y2 = (y + dash).min(sr.max.y);
+                painter.line_segment(
+                    [egui::pos2(axis_x + 0.8, y), egui::pos2(axis_x + 0.8, y2)],
+                    shadow,
+                );
+                painter.line_segment([egui::pos2(axis_x, y), egui::pos2(axis_x, y2)], white);
+                y += dash * 2.0;
+            }
+        }
+        MirrorAxis::Vertical => {
+            let axis_y = (sr.min.y + sr.max.y) / 2.0;
+            let mut x = sr.min.x;
+            while x < sr.max.x {
+                let x2 = (x + dash).min(sr.max.x);
+                painter.line_segment(
+                    [egui::pos2(x, axis_y + 0.8), egui::pos2(x2, axis_y + 0.8)],
+                    shadow,
+                );
+                painter.line_segment([egui::pos2(x, axis_y), egui::pos2(x2, axis_y)], white);
+                x += dash * 2.0;
+            }
+        }
     }
 }
 
@@ -735,6 +832,53 @@ fn paint_badge(
         format!("{}", index + 1),
         egui::FontId::proportional(11.0),
         fg,
+    );
+}
+
+fn paint_selection_marker(
+    painter: &egui::Painter,
+    sr: egui::Rect,
+    badge_visible: bool,
+    p: theme::Palette,
+    appear: f32,
+) {
+    let appear = appear.clamp(0.0, 1.0);
+    if appear <= 0.01 {
+        return;
+    }
+    let size = 15.0 * (0.8 + 0.2 * appear);
+    let center = if badge_visible {
+        sr.max - egui::vec2(size * 0.7, size * 0.7)
+    } else {
+        sr.min + egui::vec2(size * 0.7, size * 0.7)
+    };
+    let rect = egui::Rect::from_center_size(center, egui::vec2(size, size));
+    let alpha = (appear * 255.0) as u8;
+    let fill = theme::with_alpha(p.accent, alpha);
+    let stroke = theme::with_alpha(p.card, alpha);
+    painter.rect(
+        rect,
+        3.0,
+        fill,
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let c = rect.center();
+    let s = size * 0.7;
+    let mark = egui::Stroke::new(1.5, theme::with_alpha(p.on_accent, alpha));
+    painter.line_segment(
+        [
+            egui::pos2(c.x - s * 0.28, c.y),
+            egui::pos2(c.x - s * 0.04, c.y + s * 0.22),
+        ],
+        mark,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x - s * 0.04, c.y + s * 0.22),
+            egui::pos2(c.x + s * 0.32, c.y - s * 0.24),
+        ],
+        mark,
     );
 }
 

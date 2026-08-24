@@ -1,12 +1,15 @@
-//! 设置面板：默认框选模式、翻转方向、仅框选处、外观。返回值 = 配置是否被改动。
+//! 设置面板：默认框选模式、镜像方式/保留侧、仅框选处、外观。返回值 = 配置是否被改动。
 
 use eframe::egui;
 
-use crate::config::{Appearance, Config, CropMode, DirectionPref};
+use crate::config::{Appearance, Config, CropMode, KeepSide, MirrorAxis};
 use crate::ui::theme;
 
 pub fn show(ui: &mut egui::Ui, cfg: &mut Config) -> bool {
     let before = cfg.clone();
+    cfg.default_keep_side = cfg
+        .default_keep_side
+        .normalized_for_axis(cfg.default_mirror_axis);
 
     egui::Grid::new("settings_grid")
         .num_columns(2)
@@ -41,32 +44,83 @@ pub fn show(ui: &mut egui::Ui, cfg: &mut Config) -> bool {
                 });
             ui.end_row();
 
-            ui.label("默认翻转方向：");
-            egui::ComboBox::from_id_salt("direction")
-                .selected_text(match cfg.default_direction {
-                    DirectionPref::Left => "保留左半",
-                    DirectionPref::Right => "保留右半",
-                    DirectionPref::Auto => "自动",
+            ui.label("默认镜像方式：");
+            let old_axis = cfg.default_mirror_axis;
+            egui::ComboBox::from_id_salt("mirror_axis")
+                .selected_text(match cfg.default_mirror_axis {
+                    MirrorAxis::Horizontal => "水平翻转",
+                    MirrorAxis::Vertical => "垂直翻转",
                 })
                 .show_ui(ui, |ui| {
                     theme::combo_choice(
                         ui,
-                        &mut cfg.default_direction,
-                        DirectionPref::Auto,
-                        "自动",
+                        &mut cfg.default_mirror_axis,
+                        MirrorAxis::Horizontal,
+                        "水平翻转",
                     );
                     theme::combo_choice(
                         ui,
-                        &mut cfg.default_direction,
-                        DirectionPref::Left,
-                        "保留左半",
+                        &mut cfg.default_mirror_axis,
+                        MirrorAxis::Vertical,
+                        "垂直翻转",
                     );
-                    theme::combo_choice(
-                        ui,
-                        &mut cfg.default_direction,
-                        DirectionPref::Right,
-                        "保留右半",
-                    );
+                });
+            if cfg.default_mirror_axis != old_axis {
+                cfg.default_keep_side = cfg
+                    .default_keep_side
+                    .normalized_for_axis(cfg.default_mirror_axis);
+            }
+            ui.end_row();
+
+            ui.label("默认保留侧：");
+            let side_label = match (cfg.default_mirror_axis, cfg.default_keep_side) {
+                (_, KeepSide::Auto) => "自动",
+                (MirrorAxis::Horizontal, KeepSide::Left) => "保留左半",
+                (MirrorAxis::Horizontal, KeepSide::Right) => "保留右半",
+                (MirrorAxis::Vertical, KeepSide::Top) => "保留上半",
+                (MirrorAxis::Vertical, KeepSide::Bottom) => "保留下半",
+                (axis, side) => match side.normalized_for_axis(axis) {
+                    KeepSide::Left => "保留左半",
+                    KeepSide::Right => "保留右半",
+                    KeepSide::Top => "保留上半",
+                    KeepSide::Bottom => "保留下半",
+                    KeepSide::Auto => "自动",
+                },
+            };
+            egui::ComboBox::from_id_salt("keep_side")
+                .selected_text(side_label)
+                .show_ui(ui, |ui| {
+                    theme::combo_choice(ui, &mut cfg.default_keep_side, KeepSide::Auto, "自动");
+                    match cfg.default_mirror_axis {
+                        MirrorAxis::Horizontal => {
+                            theme::combo_choice(
+                                ui,
+                                &mut cfg.default_keep_side,
+                                KeepSide::Left,
+                                "保留左半",
+                            );
+                            theme::combo_choice(
+                                ui,
+                                &mut cfg.default_keep_side,
+                                KeepSide::Right,
+                                "保留右半",
+                            );
+                        }
+                        MirrorAxis::Vertical => {
+                            theme::combo_choice(
+                                ui,
+                                &mut cfg.default_keep_side,
+                                KeepSide::Top,
+                                "保留上半",
+                            );
+                            theme::combo_choice(
+                                ui,
+                                &mut cfg.default_keep_side,
+                                KeepSide::Bottom,
+                                "保留下半",
+                            );
+                        }
+                    }
                 });
             ui.end_row();
 

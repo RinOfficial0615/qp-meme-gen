@@ -63,6 +63,30 @@ fn install_cjk_fonts(ctx: &eframe::egui::Context) {
         ] {
             fonts.families.entry(family).or_default().push("cjk".into());
         }
+        // 中文字体通常没有 ↶ / ↷ 等工具栏符号，补一个系统符号字体作回退。
+        for symbol_path in [
+            r"C:\Windows\Fonts\seguisym.ttf",
+            r"C:\Windows\Fonts\seguiemj.ttf",
+        ] {
+            let Ok(symbol_bytes) = std::fs::read(symbol_path) else {
+                continue;
+            };
+            fonts.font_data.insert(
+                "symbol".into(),
+                std::sync::Arc::new(eframe::egui::FontData::from_owned(symbol_bytes)),
+            );
+            for family in [
+                eframe::egui::FontFamily::Proportional,
+                eframe::egui::FontFamily::Monospace,
+            ] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push("symbol".into());
+            }
+            break;
+        }
         ctx.set_fonts(fonts);
         return;
     }

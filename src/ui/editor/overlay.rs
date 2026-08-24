@@ -57,6 +57,7 @@ pub(super) const TEXT_BAR_H: f32 = 42.0;
 
 pub(super) fn show_text_bar(ui: &mut egui::Ui, ed: &mut Editor) {
     let p = *theme::palette(ui.ctx());
+    let frame_before = ed.snapshot();
     ui.horizontal(|ui| {
         ui.set_height(TEXT_ROW_H);
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -89,19 +90,29 @@ pub(super) fn show_text_bar(ui: &mut egui::Ui, ed: &mut Editor) {
                         .speed(1.0)
                         .max_decimals(0),
                 );
-                if (slider.inner.changed() || value.changed())
-                    && let Some(i) = ed.text_focus
-                    && let Some(t) = ed.texts.get_mut(i)
+                let size_changed = slider.inner.changed() || value.changed();
+                if size_changed && ed.text_focus.is_some() {
+                    ed.begin_text_style_history(frame_before.clone());
+                    if let Some(i) = ed.text_focus
+                        && let Some(t) = ed.texts.get_mut(i)
+                    {
+                        t.size = ed.text_draft_size;
+                        ed.dirty = true;
+                    }
+                }
+                if size_changed
+                    && (slider.inner.drag_stopped()
+                        || value.drag_stopped()
+                        || (!slider.inner.dragged() && !value.dragged()))
                 {
-                    t.size = ed.text_draft_size;
-                    ed.dirty = true;
+                    ed.finish_text_style_history();
                 }
             },
         );
 
         ui.separator();
 
-        if theme::segmented_control(
+        let color_changed = theme::segmented_control(
             ui,
             &mut ed.text_draft_color,
             &[
@@ -110,11 +121,16 @@ pub(super) fn show_text_bar(ui: &mut egui::Ui, ed: &mut Editor) {
                 (TextColor::Yellow, "黄"),
                 (TextColor::Red, "红"),
             ],
-        ) && let Some(i) = ed.text_focus
-            && let Some(t) = ed.texts.get_mut(i)
-        {
-            t.color = ed.text_draft_color;
-            ed.dirty = true;
+        );
+        if color_changed && ed.text_focus.is_some() {
+            ed.begin_text_style_history(frame_before.clone());
+            if let Some(i) = ed.text_focus
+                && let Some(t) = ed.texts.get_mut(i)
+            {
+                t.color = ed.text_draft_color;
+                ed.dirty = true;
+            }
+            ed.finish_text_style_history();
         }
 
         ui.separator();

@@ -51,6 +51,11 @@ pub struct Palette {
     pub stroke_divider: Color32,
     pub danger: Color32,
     pub success: Color32,
+    /// WinUI disabled tokens：控件底、描边、文字与复选框灰层。
+    pub disabled_fill: Color32,
+    pub disabled_stroke: Color32,
+    pub disabled_text: Color32,
+    pub disabled_overlay: Color32,
     /// 标题 ❗❓。
     pub mark: Color32,
     pub shadow_popup: Color32,
@@ -79,6 +84,10 @@ pub const LIGHT: Palette = Palette {
     stroke_divider: Color32::from_rgb(0xC6, 0xC6, 0xC6),
     danger: Color32::from_rgb(0xC4, 0x2B, 0x1C),
     success: Color32::from_rgb(0x0F, 0x7B, 0x0F),
+    disabled_fill: Color32::from_rgb(0xD6, 0xD6, 0xD6),
+    disabled_stroke: Color32::from_rgb(0x9A, 0x9A, 0x9A),
+    disabled_text: Color32::from_rgb(0x70, 0x70, 0x70),
+    disabled_overlay: Color32::BLACK,
     mark: Color32::from_rgb(0xC4, 0x2B, 0x1C),
     shadow_popup: Color32::from_black_alpha(36),
     shadow_card: Color32::from_black_alpha(28),
@@ -105,6 +114,10 @@ pub const DARK: Palette = Palette {
     stroke_divider: Color32::from_rgb(0x36, 0x36, 0x36),
     danger: Color32::from_rgb(0xFF, 0x99, 0xA4),
     success: Color32::from_rgb(0x6C, 0xCB, 0x6C),
+    disabled_fill: Color32::from_rgb(0x4E, 0x4E, 0x4E),
+    disabled_stroke: Color32::from_rgb(0x6C, 0x6C, 0x6C),
+    disabled_text: Color32::from_rgb(0xA4, 0xA4, 0xA4),
+    disabled_overlay: Color32::BLACK,
     mark: Color32::from_rgb(0xE8, 0x11, 0x23),
     shadow_popup: Color32::from_black_alpha(80),
     shadow_card: Color32::TRANSPARENT,
@@ -319,8 +332,88 @@ pub fn segmented_control<T: Copy + PartialEq>(
     changed
 }
 
+/// 可显示“无共同值”的分段选择器。多选配置不一致时传 `None`，
+/// 控件保持灰边；用户点下具体选项后返回该值，由调用方批量应用。
+pub fn segmented_control_optional<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    value: Option<T>,
+    options: &[(T, &str)],
+    enabled: bool,
+) -> Option<T> {
+    let p = *palette(ui.ctx());
+    let mut picked = None;
+    let frame = egui::Frame::default()
+        .fill(if enabled { p.subtle } else { p.bg })
+        .corner_radius(CornerRadius::same(metrics::CONTROL_RADIUS + 2))
+        .inner_margin(egui::Margin::same(2));
+    frame.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (v, label) in options {
+            let selected = enabled && value == Some(*v);
+            let id = ui.next_auto_id();
+            let hovered = enabled
+                && ui
+                    .ctx()
+                    .read_response(id)
+                    .is_some_and(|r| r.hovered() && !r.is_pointer_button_down_on());
+            let text_color = if !enabled {
+                p.text_secondary
+            } else if selected {
+                p.text
+            } else {
+                p.text_secondary
+            };
+            let fill = if selected {
+                p.accent_tint
+            } else if hovered {
+                p.control_hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            let stroke = if selected { p.accent } else { p.stroke_control };
+            let resp = ui.add_enabled(
+                enabled,
+                egui::Button::new(egui::RichText::new(*label).color(text_color))
+                    .fill(fill)
+                    .stroke(Stroke::new(1.0, stroke))
+                    .corner_radius(CornerRadius::same(metrics::CONTROL_RADIUS)),
+            );
+            if resp.clicked() {
+                picked = Some(*v);
+            }
+        }
+    });
+    picked
+}
+
 /// WinUI 3 复选框：未选中 = 实心底 + 灰边（悬停蓝边），选中 = 强调色底 + 对勾。
 pub fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
+    accent_checkbox_enabled(ui, checked, label, true)
+}
+
+/// 带禁用过渡的 WinUI 3 复选框。禁用只影响交互与视觉，不改变当前状态。
+pub fn accent_checkbox_enabled(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
+    let mut state = Some(*checked);
+    let resp = tristate_checkbox(ui, &mut state, label, enabled);
+    if resp.changed() {
+        *checked = state.unwrap_or(true);
+    }
+    resp
+}
+
+/// WinUI 3 风格三态复选框：`Some(true)` = 勾，`None` = 横线，
+/// `Some(false)` = 空白。混合态点击后统一设为勾选。
+pub fn tristate_checkbox(
+    ui: &mut egui::Ui,
+    state: &mut Option<bool>,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
     let p = *palette(ui.ctx());
     let box_side = 16.0;
     let gap = 6.0;
@@ -332,25 +425,38 @@ pub fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> eg
     let width = box_side + gap + galley.size().x + 4.0;
     let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *checked, label)
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            enabled,
+            *state == Some(true),
+            label,
+        )
     });
 
-    if resp.clicked() {
-        *checked = !*checked;
+    if enabled && resp.clicked() {
+        *state = match *state {
+            None => Some(true),
+            Some(v) => Some(!v),
+        };
         resp.mark_changed();
     }
 
     let t = anim::ease_out(ui.ctx().animate_bool_with_time(
         resp.id.with("on"),
-        *checked,
+        *state == Some(true),
+        anim::FAST.as_secs_f32(),
+    ));
+    let enabled_t = anim::ease_out(ui.ctx().animate_bool_with_time(
+        resp.id.with("enabled"),
+        enabled,
         anim::FAST.as_secs_f32(),
     ));
     let hover = hover_t(
         ui,
         resp.id.with("hov"),
-        resp.hovered() && !resp.is_pointer_button_down_on(),
+        enabled && resp.hovered() && !resp.is_pointer_button_down_on(),
     );
-    let pressed = resp.is_pointer_button_down_on();
+    let pressed = enabled && resp.is_pointer_button_down_on();
 
     let box_rect = egui::Rect::from_center_size(
         egui::pos2(rect.min.x + 2.0 + box_side * 0.5, rect.center().y),
@@ -368,9 +474,13 @@ pub fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> eg
     } else {
         lerp_color(p.accent, p.accent_hover, hover)
     };
-    let fill = lerp_color(rest_fill, on_fill, t);
-    let rest_stroke = lerp_color(p.stroke_control, p.accent, hover);
-    let stroke = Stroke::new(1.0, lerp_color(rest_stroke, p.accent, t));
+    let mut active_fill = lerp_color(rest_fill, on_fill, t);
+    let active_stroke = lerp_color(p.stroke_control, p.accent, hover * 0.8 + t * 0.2);
+    if state.is_none() {
+        active_fill = lerp_color(p.accent, p.accent_hover, hover);
+    }
+    let fill = lerp_color(p.disabled_fill, active_fill, enabled_t);
+    let stroke = Stroke::new(1.0, lerp_color(p.disabled_stroke, active_stroke, enabled_t));
 
     let painter = ui.painter();
     painter.rect(
@@ -381,10 +491,23 @@ pub fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> eg
         egui::StrokeKind::Inside,
     );
 
-    if t > 0.01 {
+    if state.is_none() {
+        let c = box_rect.center();
+        let col = lerp_color(p.disabled_text, p.on_accent, enabled_t);
+        painter.line_segment(
+            [
+                egui::pos2(c.x - box_side * 0.25, c.y),
+                egui::pos2(c.x + box_side * 0.25, c.y),
+            ],
+            Stroke::new(1.6, col),
+        );
+    } else if t > 0.01 {
         let c = box_rect.center();
         let s = box_side * (0.72 + 0.08 * t);
-        let col = with_alpha(p.on_accent, (t * 255.0) as u8);
+        let col = with_alpha(
+            lerp_color(p.disabled_text, p.on_accent, enabled_t),
+            (t * 255.0) as u8,
+        );
         let mark = Stroke::new(1.5, col);
         painter.line_segment(
             [
@@ -402,6 +525,16 @@ pub fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> eg
         );
     }
 
+    // 复选框单独叠加灰层，文字保持独立的禁用色过渡。
+    let overlay_alpha = ((1.0 - enabled_t) * 24.0).round() as u8;
+    if overlay_alpha > 0 {
+        painter.rect_filled(
+            box_rect,
+            CornerRadius::same(metrics::CONTROL_RADIUS),
+            with_alpha(p.disabled_overlay, overlay_alpha),
+        );
+    }
+
     // CJK 行框比字面高一截，按墨水区域中心对齐勾选框，而不是 galley.size。
     let ink = galley.mesh_bounds;
     let text_y = if ink.height() > 0.0 {
@@ -409,7 +542,11 @@ pub fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> eg
     } else {
         box_rect.center().y - galley.size().y * 0.5
     };
-    painter.galley(egui::pos2(box_rect.max.x + gap, text_y), galley, p.text);
+    painter.galley(
+        egui::pos2(box_rect.max.x + gap, text_y),
+        galley,
+        lerp_color(p.disabled_text, p.text, enabled_t),
+    );
     resp
 }
 

@@ -138,7 +138,8 @@ impl QpApp {
         let mut ed = editor::Editor::new(
             img,
             path,
-            self.config.default_direction,
+            self.config.default_mirror_axis,
+            self.config.default_keep_side,
             self.config.default_crop_export,
         );
         match self.config.default_crop_mode {
@@ -151,6 +152,7 @@ impl QpApp {
             }
         }
         ed.refresh_result(ctx);
+        ed.reset_history();
         self.screen = Screen::Editor(Box::new(ed));
         if from_home {
             self.kick_nav(1.0);

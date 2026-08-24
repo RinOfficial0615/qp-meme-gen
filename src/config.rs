@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub use crate::core::mirror::{KeepSide, MirrorAxis};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CropMode {
@@ -14,14 +16,6 @@ pub enum CropMode {
     Multi,
     /// 打开图片时框选整张图片。
     Full,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DirectionPref {
-    Left,
-    Right,
-    Auto,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +41,8 @@ impl Appearance {
 #[serde(default)]
 pub struct Config {
     pub default_crop_mode: CropMode,
-    pub default_direction: DirectionPref,
+    pub default_mirror_axis: MirrorAxis,
+    pub default_keep_side: KeepSide,
     pub appearance: Appearance,
     pub default_crop_export: bool,
 }
@@ -56,7 +51,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             default_crop_mode: CropMode::Single,
-            default_direction: DirectionPref::Auto,
+            default_mirror_axis: MirrorAxis::Horizontal,
+            default_keep_side: KeepSide::Auto,
             appearance: Appearance::System,
             default_crop_export: true,
         }
@@ -75,7 +71,16 @@ impl Config {
         let Ok(text) = std::fs::read_to_string(config_path()) else {
             return Self::default();
         };
-        toml::from_str(&text).unwrap_or_default()
+        toml::from_str::<Self>(&text)
+            .unwrap_or_default()
+            .normalized()
+    }
+
+    fn normalized(mut self) -> Self {
+        self.default_keep_side = self
+            .default_keep_side
+            .normalized_for_axis(self.default_mirror_axis);
+        self
     }
 
     pub fn save(&self) -> Result<()> {
@@ -92,22 +97,34 @@ mod tests {
     fn roundtrip() {
         let cfg = Config {
             default_crop_mode: CropMode::Full,
-            default_direction: DirectionPref::Right,
+            default_mirror_axis: MirrorAxis::Vertical,
+            default_keep_side: KeepSide::Bottom,
             appearance: Appearance::Dark,
             default_crop_export: false,
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("default_mirror_axis = \"vertical\""));
+        assert!(text.contains("default_keep_side = \"bottom\""));
+        assert!(!text.contains("default_direction"));
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg, back);
     }
 
     #[test]
     fn partial_toml_uses_defaults() {
-        let cfg: Config = toml::from_str("default_direction = \"left\"").unwrap();
-        assert_eq!(cfg.default_direction, DirectionPref::Left);
+        let cfg: Config = toml::from_str("default_keep_side = \"left\"").unwrap();
+        assert_eq!(cfg.default_keep_side, KeepSide::Left);
+        assert_eq!(cfg.default_mirror_axis, MirrorAxis::Horizontal);
         assert_eq!(cfg.default_crop_mode, CropMode::Single);
         assert_eq!(cfg.appearance, Appearance::System);
         assert!(cfg.default_crop_export);
+    }
+
+    #[test]
+    fn missing_new_mirror_fields_use_horizontal_auto_defaults() {
+        let cfg: Config = toml::from_str("appearance = \"dark\"").unwrap();
+        assert_eq!(cfg.default_mirror_axis, MirrorAxis::Horizontal);
+        assert_eq!(cfg.default_keep_side, KeepSide::Auto);
     }
 
     #[test]
