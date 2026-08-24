@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use ab_glyph::{Font, FontVec, Glyph, PxScale, ScaleFont, point};
 use image::RgbaImage;
 
-const FONT_CANDIDATES: [&str; 3] = [
+pub(crate) const FONT_CANDIDATES: [&str; 3] = [
     r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\simhei.ttf",
     r"C:\Windows\Fonts\simsun.ttc",

@@ -32,6 +32,41 @@ fn ui_screenshot_has_no_face() {
 }
 
 #[test]
+fn detects_multiple_faces_in_crowd() {
+    let img = image::open(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/people.png"
+    ))
+    .expect("读取多人脸夹具失败")
+    .to_rgba8();
+    let det = FaceDetector::new().expect("加载内嵌模型失败");
+    let faces = det.detect(&img).expect("推理失败");
+    assert!(
+        faces.len() >= 8,
+        "集体照应检出多张人脸，实际 {}",
+        faces.len()
+    );
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let min_x = faces
+        .iter()
+        .map(|f| (f.bbox[0] + f.bbox[2]) * 0.5)
+        .fold(f32::MAX, f32::min);
+    let max_x = faces
+        .iter()
+        .map(|f| (f.bbox[0] + f.bbox[2]) * 0.5)
+        .fold(f32::MIN, f32::max);
+    assert!(
+        max_x - min_x > w * 0.25,
+        "多人脸应分布在画面不同位置: min_x={min_x} max_x={max_x} w={w}"
+    );
+    for face in &faces {
+        assert!(face.bbox[2] > face.bbox[0] && face.bbox[3] > face.bbox[1]);
+        assert!(face.bbox[0] < w && face.bbox[1] < h);
+        assert!(face.bbox[2] > 0.0 && face.bbox[3] > 0.0);
+    }
+}
+
+#[test]
 fn detects_face_in_fixture() {
     let img = fixture();
     let (w, h) = (img.width() as f32, img.height() as f32);

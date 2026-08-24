@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, Stroke};
+use eframe::egui::{self, Align2, CornerRadius, Stroke};
 
 use super::theme::anim;
 
@@ -106,7 +106,7 @@ fn toast_card(ui: &mut egui::Ui, t: &Toast) {
             offset: [0, 2],
             blur: 12,
             spread: 0,
-            color: Color32::from_black_alpha(40),
+            color: p.shadow_toast,
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {

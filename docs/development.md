@@ -28,11 +28,12 @@ InsightFace 1.0 的更新是 Evaluation Studio GUI 和默认双尺度检测（12
 | --- | --- |
 | `core::mirror` | 左/右方向、奇数宽、框外不动、自动方向、多框 |
 | `core::text` | 空串不画、中文字形落在中心附近（无系统字体则跳过） |
+| `core::crop` | 人脸框几何、中央框比例、未覆盖脸选取 |
 | `detect::scrfd` | 解码、NMS、低分过滤 |
-| `clipboard` | 粘贴手势、DIB、file://、HTML `src=` |
+| `app::clipboard` | 粘贴手势、DIB、file://、HTML `src=` |
 | `config` | 读写、`"face"` 别名、缺省字段 |
-| `ui::editor` | 人脸框几何、加框选脸、整图禁止加框、中央框比例 |
-| `tests/e2e.rs` | 真实模型：`face.png` 有脸、`no_face_ui.png` 无脸、整图镜像对称 |
+| `ui::editor` | 加框选脸、整图禁止加框、文字叠层 |
+| `tests/e2e.rs` | 真实模型：`face.png` 有脸、`people.png` 多人、`no_face_ui.png` 无脸、整图镜像对称 |
 
 夹具在 `tests/fixtures/`。`examples/make_sample.rs` 用人脸夹具打一份镜像样本，方便肉眼看。
 

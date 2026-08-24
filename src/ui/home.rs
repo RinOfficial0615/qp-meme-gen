@@ -18,12 +18,30 @@ pub fn show(ui: &mut egui::Ui, cfg: &mut Config) -> HomeAction {
         let p = *theme::palette(ui.ctx());
         ui.add_space(36.0);
 
-        ui.label(
-            egui::RichText::new("！？强强？！")
-                .size(30.0)
-                .color(p.text)
-                .strong(),
-        );
+        let title_font = egui::FontId::proportional(30.0);
+        let mark = egui::TextFormat {
+            font_id: title_font.clone(),
+            color: p.mark,
+            valign: egui::Align::Center,
+            extra_letter_spacing: 0.0,
+            expand_bg: 0.0,
+            ..Default::default()
+        };
+        let body = egui::TextFormat {
+            font_id: title_font,
+            color: p.text,
+            valign: egui::Align::Center,
+            extra_letter_spacing: 0.0,
+            expand_bg: 0.0,
+            ..Default::default()
+        };
+        let mut title = egui::text::LayoutJob::default();
+        title.append("❗", 0.0, mark.clone());
+        title.append("❓", 0.0, mark.clone());
+        title.append("强强", 0.0, body);
+        title.append("❓", 0.0, mark.clone());
+        title.append("❗", 0.0, mark);
+        ui.label(title);
         ui.label(
             egui::RichText::new("对称镜像梗图生成器")
                 .size(14.0)

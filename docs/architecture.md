@@ -6,13 +6,11 @@
 src/
   main.rs           入口：argv、隐藏控制台、转交 lib
   lib.rs            启动 GUI、注入 CJK 字体、panic 弹窗
-  app.rs            Home / Editor 状态机，打开与检测的汇合点
-  config.rs         exe 旁 qp-meme-gen.toml
-  clipboard.rs      Windows 读图（对齐 Chromium clipboard_win.cc）
-  core/mirror.rs    镜像纯函数
-  core/text.rs      叠加文字：排版、描边、画进 RGBA
+  app/              Home / Editor 状态机；clipboard 只给粘贴用
+  config.rs         设置模型 + exe 旁 qp-meme-gen.toml
+  core/             镜像、叠加文字、人脸→选框（纯函数，无 GUI）
   detect/           FaceDetector 门面 + SCRFD
-  ui/               主页、编辑器、设置、主题、toast
+  ui/               主页、编辑器（canvas / overlay）、设置、主题、toast
 assets/
   det_10g.onnx      构建脚本下载，不进 git
 build.rs            Hugging Face 下载 + sha256 校验
@@ -35,7 +33,7 @@ build.rs            Hugging Face 下载 + sha256 校验
 
 ## 叠加文字
 
-`core::text` 用系统 CJK 字体（`msyh.ttc` → `simhei.ttf` → `simsun.ttc`）把字符串画到 RGBA。中心点 `(cx, cy)`，8 方向描边后再填内部。
+`core::text` 用系统 CJK 字体（`msyh.ttc` → `simhei.ttf` → `simsun.ttc`）把字符串画到 RGBA。中心点 `(cx, cy)`，8 方向描边后再填内部。`core::crop` 把检测结果变成选框，与 GUI 无关。
 
 编辑器合成顺序：克隆源图 → 逐条 `draw`（正在输入的那条跳过）→ 再对每个选框做 `mirror`。因此框内文字与照片一起左右翻转，而不是画在镜像结果上面。
 
@@ -47,7 +45,7 @@ build.rs            Hugging Face 下载 + sha256 校验
 
 ## SCRFD
 
-InsightFace 1.0 没有换检测架构，仍是 SCRFD。Python 包默认模型包是 **buffalo_l**，其中检测器为 **SCRFD-10GF**（`det_10g.onnx`，5 关键点）。独立发布的 `scrfd_2.5g_bnkps.onnx` 是同一家族的小模型，不在 buffalo 包里，Hugging Face `deepghs/insightface` 也不提供。
+InsightFace 1.0 相比 0.7 没有换检测架构，仍是 SCRFD。Python 包默认模型包是 **buffalo_l**，其中检测器为 **SCRFD-10GF**（`det_10g.onnx`，5 关键点）。独立发布的 `scrfd_2.5g_bnkps.onnx` 是同一家族的小模型，不在 buffalo 包里，Hugging Face `deepghs/insightface` 也不提供。
 
 本仓库构建时从该镜像拉取 `buffalo_l/det_10g.onnx`。I/O 与 2.5G bnkps 同族：letterbox 到 640×640 时三个 stride 的行数为 12800 / 3200 / 800，每行 score 1、bbox 4、kps 10。buffalo 导出是动态空间维、输出名为数字节点；解码按列数和行数归类，不依赖 `score_8` 这类名字。
 
@@ -56,7 +54,7 @@ InsightFace 1.0 没有换检测架构，仍是 SCRFD。Python 包默认模型包
 - ONNX 分数已是 sigmoid 概率，不用再套一层；阈值 0.5，NMS IoU 0.4
 - `detect()` 按分数降序；单人模式再取面积最大者
 
-打开图片且默认模式为人脸时同步检测一次；编辑器「人脸框选」再跑。
+打开图片且默认模式为人脸时同步检测一次，结果缓存在编辑器里。之后「人脸框选」复用缓存，整图框选再切回来不必再跑；换图会丢掉缓存。检测失败不写入缓存，方便重试。
 
 ## 粘贴
 

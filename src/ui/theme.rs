@@ -46,9 +46,16 @@ pub struct Palette {
     pub text: Color32,
     pub text_secondary: Color32,
     pub stroke_control: Color32,
+    /// 悬停/按下时的控件描边。浅色要比静止态更深，否则白底上看不出反馈。
+    pub stroke_hover: Color32,
     pub stroke_divider: Color32,
     pub danger: Color32,
     pub success: Color32,
+    /// 标题 ❗❓。
+    pub mark: Color32,
+    pub shadow_popup: Color32,
+    pub shadow_card: Color32,
+    pub shadow_toast: Color32,
 }
 
 /// WinUI 3 浅色模式色板。描边/轨道要比卡片底更深一档，否则 1px 框在浅底上会消失。
@@ -62,14 +69,20 @@ pub const LIGHT: Palette = Palette {
     card: Color32::WHITE,
     subtle: Color32::from_rgb(0xE6, 0xE6, 0xE6),
     control: Color32::WHITE,
-    control_hover: Color32::from_rgb(0xF0, 0xF0, 0xF0),
-    control_pressed: Color32::from_rgb(0xE4, 0xE4, 0xE4),
+    // 浅色近白时 15 档几乎看不见，悬停要沉到灰、按下再深一档。
+    control_hover: Color32::from_rgb(0xE1, 0xE1, 0xE1),
+    control_pressed: Color32::from_rgb(0xC8, 0xC8, 0xC8),
     text: Color32::from_rgb(0x1B, 0x1B, 0x1B),
     text_secondary: Color32::from_rgb(0x5D, 0x5D, 0x5D),
     stroke_control: Color32::from_rgb(0x8A, 0x8A, 0x8A),
+    stroke_hover: Color32::from_rgb(0x5A, 0x5A, 0x5A),
     stroke_divider: Color32::from_rgb(0xC6, 0xC6, 0xC6),
     danger: Color32::from_rgb(0xC4, 0x2B, 0x1C),
     success: Color32::from_rgb(0x0F, 0x7B, 0x0F),
+    mark: Color32::from_rgb(0xC4, 0x2B, 0x1C),
+    shadow_popup: Color32::from_black_alpha(36),
+    shadow_card: Color32::from_black_alpha(28),
+    shadow_toast: Color32::from_black_alpha(40),
 };
 
 /// WinUI 3 深色模式色板。
@@ -88,9 +101,14 @@ pub const DARK: Palette = Palette {
     text: Color32::WHITE,
     text_secondary: Color32::from_rgb(0xAD, 0xAD, 0xAD),
     stroke_control: Color32::from_rgb(0x45, 0x45, 0x45),
+    stroke_hover: Color32::from_rgb(0x6E, 0x6E, 0x6E),
     stroke_divider: Color32::from_rgb(0x36, 0x36, 0x36),
     danger: Color32::from_rgb(0xFF, 0x99, 0xA4),
     success: Color32::from_rgb(0x6C, 0xCB, 0x6C),
+    mark: Color32::from_rgb(0xE8, 0x11, 0x23),
+    shadow_popup: Color32::from_black_alpha(80),
+    shadow_card: Color32::TRANSPARENT,
+    shadow_toast: Color32::from_black_alpha(40),
 };
 
 /// 取当前主题色板。
@@ -144,8 +162,8 @@ fn styleize(ctx: &egui::Context, theme: Theme) {
     );
     v.widgets.noninteractive.bg_fill = p.bg;
     rest(&mut v.widgets.inactive, p.control, p.stroke_control);
-    rest(&mut v.widgets.hovered, p.control_hover, p.stroke_control);
-    rest(&mut v.widgets.active, p.control_pressed, p.stroke_control);
+    rest(&mut v.widgets.hovered, p.control_hover, p.stroke_hover);
+    rest(&mut v.widgets.active, p.control_pressed, p.stroke_hover);
     rest(&mut v.widgets.open, p.control, p.accent);
 
     v.window_corner_radius = CornerRadius::same(metrics::CARD_RADIUS);
@@ -154,10 +172,7 @@ fn styleize(ctx: &egui::Context, theme: Theme) {
         offset: [0, 4],
         blur: 16,
         spread: 0,
-        color: match theme {
-            Theme::Light => Color32::from_black_alpha(36),
-            Theme::Dark => Color32::from_black_alpha(80),
-        },
+        color: p.shadow_popup,
     };
 
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
@@ -170,14 +185,16 @@ fn styleize(ctx: &egui::Context, theme: Theme) {
 }
 
 fn card_shadow(ctx: &egui::Context) -> egui::epaint::Shadow {
-    match ctx.theme() {
-        Theme::Light => egui::epaint::Shadow {
+    let c = palette(ctx).shadow_card;
+    if c.a() == 0 {
+        egui::epaint::Shadow::NONE
+    } else {
+        egui::epaint::Shadow {
             offset: [0, 2],
             blur: 8,
             spread: 0,
-            color: Color32::from_black_alpha(28),
-        },
-        Theme::Dark => egui::epaint::Shadow::NONE,
+            color: c,
+        }
     }
 }
 
@@ -190,6 +207,46 @@ pub fn card_frame(ctx: &egui::Context) -> egui::Frame {
         .corner_radius(CornerRadius::same(metrics::CARD_RADIUS))
         .shadow(card_shadow(ctx))
         .inner_margin(egui::Margin::same(20))
+}
+
+/// 工具栏开关：选中态在 167ms ease-out 里从控件底插到强调浅底，描边跟到强调色。
+pub fn toggle_button(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
+    let p = *palette(ui.ctx());
+    let id = ui.next_auto_id();
+    let prev = ui.ctx().read_response(id);
+    let hovered = prev
+        .as_ref()
+        .is_some_and(|r| r.hovered() && !r.is_pointer_button_down_on());
+    let pressed = prev.as_ref().is_some_and(|r| r.is_pointer_button_down_on());
+    let t = anim::ease_out(ui.ctx().animate_bool_with_time(
+        id.with("on"),
+        selected,
+        anim::FAST.as_secs_f32(),
+    ));
+    let hover = hover_t(ui, id.with("hov"), hovered);
+
+    let rest_fill = if pressed {
+        p.control_pressed
+    } else {
+        lerp_color(p.control, p.control_hover, hover)
+    };
+    let on_fill = if pressed {
+        lerp_color(p.accent_tint, p.accent, 0.22)
+    } else {
+        lerp_color(p.accent_tint, p.accent, hover * 0.18)
+    };
+    let fill = lerp_color(rest_fill, on_fill, t);
+    let rest_stroke = lerp_color(p.stroke_control, p.accent, hover);
+    let stroke = Stroke::new(1.0, lerp_color(rest_stroke, p.accent, t));
+
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(p.text))
+            .fill(fill)
+            .stroke(stroke)
+            .selected(selected)
+            .corner_radius(CornerRadius::same(metrics::CONTROL_RADIUS))
+            .min_size(egui::vec2(0.0, 30.0)),
+    )
 }
 
 /// 主按钮（强调色填充，悬停/按下按 Fluent 强调色递进）。不叠字，避免字号跳变。
@@ -327,12 +384,7 @@ pub fn accent_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> eg
     if t > 0.01 {
         let c = box_rect.center();
         let s = box_side * (0.72 + 0.08 * t);
-        let col = Color32::from_rgba_unmultiplied(
-            p.on_accent.r(),
-            p.on_accent.g(),
-            p.on_accent.b(),
-            (t * 255.0) as u8,
-        );
+        let col = with_alpha(p.on_accent, (t * 255.0) as u8);
         let mark = Stroke::new(1.5, col);
         painter.line_segment(
             [
@@ -376,6 +428,39 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
         f(a.b(), b.b()),
         f(a.a(), b.a()),
     )
+}
+
+/// 保留 RGB，替换 alpha。
+pub fn with_alpha(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// 画布叠层：画在照片上，不跟 app 浅/深切换。
+pub mod canvas {
+    use eframe::egui::{Color32, Stroke};
+
+    /// 非选区压暗。
+    pub const DIM: Color32 = Color32::from_black_alpha(70);
+    /// 新框预览填充不透明度。
+    pub const PREVIEW_ALPHA: u8 = 28;
+
+    /// 选框中轴：白虚线 + 黑影，保证任意照片上都看得见。
+    pub fn axis_strokes(alpha: f32) -> (Stroke, Stroke) {
+        let a = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+        (
+            Stroke::new(1.5, Color32::from_white_alpha(a)),
+            Stroke::new(1.5, Color32::from_black_alpha((90.0 * alpha) as u8)),
+        )
+    }
+}
+
+/// 画布内联输入框。黑字浅底、其余深底，跟叠加字色对比，不跟 app 主题。
+pub fn inline_editor_chrome(black_text: bool) -> (Color32, Color32) {
+    if black_text {
+        (LIGHT.bg, LIGHT.text_secondary)
+    } else {
+        (DARK.card, LIGHT.control_pressed)
+    }
 }
 
 /// 下拉项：选中 = 强调色底 + 反色字。

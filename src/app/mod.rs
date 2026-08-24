@@ -1,18 +1,20 @@
 //! 应用状态机：Home / Editor 两个屏幕，四种打开方式在此汇合
 //! （对话框 / 拖入窗口 / 拖到 exe / 粘贴）。
 
+mod clipboard;
+
 use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui;
 use image::RgbaImage;
 
-use crate::clipboard::{self, PastedImage};
 use crate::config::{Config, CropMode};
 use crate::detect::FaceDetector;
 use crate::ui::theme::PageEnter;
 use crate::ui::toast::{ToastKind, Toasts};
 use crate::ui::{editor, home};
+use clipboard::PastedImage;
 
 enum Screen {
     Home,
@@ -41,47 +43,35 @@ fn ensure_detector(slot: &mut Option<FaceDetector>) -> anyhow::Result<&FaceDetec
 
 /// 对编辑器当前图片做人脸检测并设置选框。
 /// 无人脸或检测失败时在画面中央放比例框（不回退整图）。
-/// `multi` = 为每张脸建框，否则只框面积最大的主脸。检测结果会缓存供「加框」使用。
+/// `multi` = 为每张脸建框，否则只框面积最大的主脸。
+/// 同一张图检测过就复用缓存（整图框选再切回人脸不必再跑）。
 fn apply_face_boxes(
     detector_slot: &mut Option<FaceDetector>,
     ed: &mut editor::Editor,
     multi: bool,
 ) -> Result<(), String> {
+    if ed.apply_cached_face_boxes(multi) {
+        return Ok(());
+    }
     let det = match ensure_detector(detector_slot) {
         Ok(d) => d,
         Err(e) => {
-            ed.set_faces(Vec::new());
             ed.apply_face_boxes(&[]);
             return Err(format!("人脸检测初始化失败：{e}，已在中央放置选框"));
         }
     };
     match det.detect(&ed.img) {
         Ok(faces) => {
-            if faces.is_empty() {
-                ed.apply_face_boxes(&[]);
-                ed.set_faces(faces);
+            let empty = faces.is_empty();
+            ed.set_faces(faces);
+            let _ = ed.apply_cached_face_boxes(multi);
+            if empty {
                 Err("未检测到人脸，已在中央放置选框".into())
-            } else if multi {
-                ed.apply_face_boxes(&faces);
-                ed.set_faces(faces);
-                Ok(())
             } else {
-                let primary = faces
-                    .iter()
-                    .max_by(|a, b| {
-                        a.area()
-                            .partial_cmp(&b.area())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .copied()
-                    .expect("faces 非空");
-                ed.apply_face_boxes(&[primary]);
-                ed.set_faces(faces);
                 Ok(())
             }
         }
         Err(e) => {
-            ed.set_faces(Vec::new());
             ed.apply_face_boxes(&[]);
             Err(format!("人脸检测失败：{e}，已在中央放置选框"))
         }
@@ -101,20 +91,14 @@ fn ensure_faces_for_add(
     }
     let det = match ensure_detector(detector_slot) {
         Ok(d) => d,
-        Err(e) => {
-            ed.set_faces(Vec::new());
-            return Err(format!("人脸检测初始化失败：{e}，已在中央加框"));
-        }
+        Err(e) => return Err(format!("人脸检测初始化失败：{e}，已在中央加框")),
     };
     match det.detect(&ed.img) {
         Ok(faces) => {
             ed.set_faces(faces);
             Ok(())
         }
-        Err(e) => {
-            ed.set_faces(Vec::new());
-            Err(format!("人脸检测失败：{e}，已在中央加框"))
-        }
+        Err(e) => Err(format!("人脸检测失败：{e}，已在中央加框")),
     }
 }
 

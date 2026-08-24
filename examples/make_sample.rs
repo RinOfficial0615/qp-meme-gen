@@ -1,8 +1,8 @@
 //! 人工验收辅助：用夹具图生成人脸框/整图两种镜像结果，输出到临时目录供肉眼检查。
 
+use qp_meme_gen::core::crop::face_box;
 use qp_meme_gen::core::mirror::{self, Rect};
 use qp_meme_gen::detect::FaceDetector;
-use qp_meme_gen::ui::editor::face_box;
 
 fn main() {
     let img = image::open("tests/fixtures/face.png")

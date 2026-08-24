@@ -2,7 +2,6 @@
 //! 全部逻辑在 lib 内，main.rs 只是薄壳，测试通过本 crate 的模块接口进行。
 
 pub mod app;
-mod clipboard;
 pub mod config;
 pub mod core;
 pub mod detect;
@@ -17,8 +16,8 @@ pub fn run(initial_image: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("qp-meme-gen 强强梗图生成器")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([1120.0, 680.0])
+            .with_inner_size([1440.0, 860.0])
+            .with_min_inner_size([1280.0, 720.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -49,12 +48,7 @@ fn install_panic_hook() {
 
 /// 注入系统中文字体（egui 内置字体不含 CJK）。全失败时保持默认字体。
 fn install_cjk_fonts(ctx: &eframe::egui::Context) {
-    const CANDIDATES: [&str; 3] = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ];
-    for path in CANDIDATES {
+    for path in crate::core::text::FONT_CANDIDATES {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
